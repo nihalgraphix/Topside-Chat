@@ -1,0 +1,6 @@
+{
+  "name": "Aether Chat",
+  "description": "Next-generation private messaging platform with a futuristic glassmorphic interface, real-time messaging, audio/video calls, channels, and groups.",
+  "requestFramePermissions": ["camera", "microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -214,11 +214,31 @@ class AetherDatabase {
   }
 
   public getUserByUsername(username: string): (User & { passwordHash: string }) | undefined {
-    return this.data.users.find(u => u.username.toLowerCase() === username.toLowerCase());
+    const clean = username.trim().toLowerCase().replace(/^@/, '');
+    const normalized = clean.replace(/[^a-z0-9_]/g, '_');
+    return this.data.users.find(
+      u =>
+        u.username.toLowerCase() === clean ||
+        u.username.toLowerCase() === normalized ||
+        u.displayName.toLowerCase() === clean
+    );
   }
 
   public getUserByEmail(email: string): (User & { passwordHash: string }) | undefined {
-    return this.data.users.find(u => u.email.toLowerCase() === email.toLowerCase());
+    const clean = email.trim().toLowerCase();
+    return this.data.users.find(u => u.email.toLowerCase() === clean);
+  }
+
+  public updateUserPassword(id: string, passwordHash: string): void {
+    const idx = this.data.users.findIndex(u => u.id === id);
+    if (idx === -1) return;
+    this.data.users[idx].passwordHash = passwordHash;
+    this.queueSave();
+    try {
+      sqlStorage.saveUser(this.data.users[idx], passwordHash);
+    } catch (err) {
+      console.error('Failed to update user password in SQLite', err);
+    }
   }
 
   public createUser(user: User & { passwordHash: string }): User {

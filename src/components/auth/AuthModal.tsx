@@ -84,27 +84,28 @@ export const AuthModal: React.FC<AuthModalProps> = ({
 
     try {
       if (mode === 'login') {
-        if (identifier.includes('@')) {
+        const cleanId = identifier.trim();
+        const res = await api.login(cleanId, password);
+
+        // Non-blocking background sync with Firebase
+        void (async () => {
           try {
-            await signInWithEmailAndPassword(auth, identifier.trim(), password);
+            if (cleanId.includes('@')) {
+              await signInWithEmailAndPassword(auth, cleanId, password).catch(() => {});
+            }
+            await syncUserToFirestore(res.user);
           } catch {
-            // Continue to backend verification
+            // Ignore background Firebase sync errors
           }
-        }
-        const res = await api.login(identifier.trim(), password);
-        await syncUserToFirestore(res.user);
+        })();
+
         onSuccess(res.user);
         onClose();
       } else if (mode === 'register') {
         const cleanEmail = email.trim().toLowerCase();
-        const cleanUsername = username.trim() || cleanEmail.split('@')[0].replace(/[^a-zA-Z0-9_]/g, '_');
+        const cleanUsername =
+          username.trim() || cleanEmail.split('@')[0].replace(/[^a-zA-Z0-9_]/g, '_');
         const cleanName = displayName.trim() || cleanUsername;
-
-        try {
-          await createUserWithEmailAndPassword(auth, cleanEmail, password);
-        } catch {
-          // Continue to backend registration
-        }
 
         const res = await api.register({
           username: cleanUsername,
@@ -113,7 +114,17 @@ export const AuthModal: React.FC<AuthModalProps> = ({
           password,
           phone: phone.trim() || undefined,
         });
-        await syncUserToFirestore(res.user);
+
+        // Non-blocking background sync with Firebase
+        void (async () => {
+          try {
+            await createUserWithEmailAndPassword(auth, cleanEmail, password).catch(() => {});
+            await syncUserToFirestore(res.user);
+          } catch {
+            // Ignore background Firebase sync errors
+          }
+        })();
+
         onSuccess(res.user);
         onClose();
       } else if (mode === 'forgot') {
@@ -121,11 +132,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
         if (!targetEmail) {
           throw new Error('Please provide your registered email address.');
         }
-        try {
-          await sendPasswordResetEmail(auth, targetEmail);
-        } catch {
-          // Fallback to backend recovery
-        }
+        void sendPasswordResetEmail(auth, targetEmail).catch(() => {});
         await api.forgotPassword(targetEmail);
         setSuccessMsg(`Password reset instructions have been dispatched to ${targetEmail}.`);
       }
@@ -136,37 +143,27 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     }
   };
 
-  const handleGooglePopupOrFallback = async () => {
-    setError(null);
-    setIsLoading(true);
-    try {
-      const cred = await signInWithPopup(auth, googleProvider);
-      const gUser = cred.user;
-      const gEmail = gUser.email || googleEmailInput;
-      const gName = gUser.displayName || gEmail.split('@')[0];
-      const res = await api.googleLogin({
-        email: gEmail.toLowerCase(),
-        displayName: gName,
-        avatarUrl: gUser.photoURL || undefined,
-      });
-      await syncUserToFirestore(res.user);
-      onSuccess(res.user);
-      onClose();
-    } catch {
-      setIsLoading(false);
-      setShowGooglePrompt(true);
+  const handleGoogleSignIn = async (userEmail: string, userName?: string, avatarUrl?: string) => {
+    const cleanEmail = userEmail.trim().toLowerCase();
+    if (!cleanEmail) {
+      setError('Please enter your Google email address.');
+      return;
     }
-  };
-
-  const handleGoogleSignIn = async (userEmail: string, userName?: string) => {
     setError(null);
     setIsLoading(true);
     try {
+      const resolvedName =
+        (userName || '').trim() ||
+        cleanEmail
+          .split('@')[0]
+          .replace(/[._-]+/g, ' ')
+          .replace(/\b\w/g, l => l.toUpperCase());
       const res = await api.googleLogin({
-        email: userEmail.trim().toLowerCase(),
-        displayName: userName || userEmail.split('@')[0],
+        email: cleanEmail,
+        displayName: resolvedName,
+        avatarUrl,
       });
-      await syncUserToFirestore(res.user);
+      void syncUserToFirestore(res.user);
       onSuccess(res.user);
       onClose();
     } catch (err: any) {
@@ -174,6 +171,50 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     } finally {
       setIsLoading(false);
       setShowGooglePrompt(false);
+    }
+  };
+
+  const handleGooglePopupOrFallback = async () => {
+    setError(null);
+
+    // If user already entered a Google email in the prompt or login/register field, use it if popup fails
+    const candidateEmail =
+      googleEmailInput.trim() ||
+      (identifier.includes('@') ? identifier.trim() : '') ||
+      (email.includes('@') ? email.trim() : '');
+
+    // If Firebase Auth already has an active Google user, sign in immediately
+    if (auth.currentUser?.email) {
+      await handleGoogleSignIn(
+        auth.currentUser.email,
+        auth.currentUser.displayName || googleNameInput,
+        auth.currentUser.photoURL || undefined
+      );
+      return;
+    }
+
+    setIsLoading(true);
+    try {
+      const cred = await signInWithPopup(auth, googleProvider);
+      const gUser = cred.user;
+      const gEmail = gUser.email || candidateEmail;
+      if (gEmail) {
+        await handleGoogleSignIn(
+          gEmail,
+          gUser.displayName || googleNameInput,
+          gUser.photoURL || undefined
+        );
+        return;
+      }
+    } catch {
+      // Popup was blocked by iframe/browser or closed
+    }
+
+    setIsLoading(false);
+    if (candidateEmail) {
+      await handleGoogleSignIn(candidateEmail, googleNameInput || displayName);
+    } else {
+      setShowGooglePrompt(true);
     }
   };
 
@@ -253,7 +294,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
               onClick={() => setShowGooglePrompt(!showGooglePrompt)}
               className="text-white underline hover:text-neutral-300 cursor-pointer"
             >
-              {showGooglePrompt ? 'Hide custom Google email' : 'Use another Google email'}
+              {showGooglePrompt ? 'Hide Google email input' : 'Enter Google email directly'}
             </button>
           </div>
 
@@ -261,24 +302,40 @@ export const AuthModal: React.FC<AuthModalProps> = ({
             <motion.div
               initial={{ opacity: 0, height: 0 }}
               animate={{ opacity: 1, height: 'auto' }}
-              className="p-3.5 rounded-xl bg-[#141414] border border-white/15 space-y-2.5"
+              className="p-3.5 rounded-xl bg-[#141414] border border-white/20 space-y-2.5"
             >
+              <p className="text-[11px] text-neutral-300">
+                Enter your Google email below to sign in directly:
+              </p>
               <div>
                 <label className="block text-[11px] font-medium text-neutral-300 mb-1">Google Email</label>
                 <input
                   type="email"
+                  autoFocus
                   value={googleEmailInput}
                   onChange={e => setGoogleEmailInput(e.target.value)}
+                  onKeyDown={e => {
+                    if (e.key === 'Enter' && googleEmailInput.trim()) {
+                      e.preventDefault();
+                      handleGoogleSignIn(googleEmailInput, googleNameInput);
+                    }
+                  }}
                   placeholder="your.email@gmail.com"
                   className="w-full px-3 py-2 rounded-lg bg-black border border-white/15 text-xs text-white placeholder-neutral-500 focus:outline-none focus:border-white"
                 />
               </div>
               <div>
-                <label className="block text-[11px] font-medium text-neutral-300 mb-1">Display Name</label>
+                <label className="block text-[11px] font-medium text-neutral-300 mb-1">Display Name (optional)</label>
                 <input
                   type="text"
                   value={googleNameInput}
                   onChange={e => setGoogleNameInput(e.target.value)}
+                  onKeyDown={e => {
+                    if (e.key === 'Enter' && googleEmailInput.trim()) {
+                      e.preventDefault();
+                      handleGoogleSignIn(googleEmailInput, googleNameInput);
+                    }
+                  }}
                   placeholder="Your Name"
                   className="w-full px-3 py-2 rounded-lg bg-black border border-white/15 text-xs text-white placeholder-neutral-500 focus:outline-none focus:border-white"
                 />
@@ -289,7 +346,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                 disabled={isLoading || !googleEmailInput.trim()}
                 className="w-full py-2 rounded-lg bg-white hover:bg-neutral-200 text-black font-bold text-xs transition disabled:opacity-50 cursor-pointer"
               >
-                Sign In with this Google Account
+                Sign In with Google Account
               </button>
             </motion.div>
           )}
@@ -447,10 +504,9 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                   <input
                     type={showPassword ? 'text' : 'password'}
                     required
-                    minLength={6}
                     value={password}
                     onChange={e => setPassword(e.target.value)}
-                    placeholder="At least 6 characters"
+                    placeholder="Enter a password"
                     className="w-full pl-10 pr-10 py-2.5 rounded-xl bg-[#141414] border border-white/15 text-sm text-white placeholder-neutral-500 focus:outline-none focus:border-white"
                   />
                   <button

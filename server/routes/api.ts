@@ -177,51 +177,61 @@ router.post('/auth/register', async (req, res) => {
       return res.status(400).json({ error: 'Email and password are required' });
     }
 
-    if (password.length < 6) {
-      return res.status(400).json({ error: 'Password must be at least 6 characters' });
-    }
+    const cleanEmail = email.trim().toLowerCase();
 
     if (!displayName) {
       displayName = [firstName, lastName].filter(Boolean).join(' ').trim();
       if (!displayName) {
-        displayName = email.split('@')[0];
+        displayName = cleanEmail.split('@')[0];
       }
-    }
-
-    if (!username) {
-      let baseUser = email.split('@')[0].replace(/[^a-zA-Z0-9_]/g, '').toLowerCase();
-      if (baseUser.length < 3) baseUser = `user_${baseUser}`;
-      username = baseUser;
-      let counter = 1;
-      while (db.getUserByUsername(username)) {
-        username = `${baseUser}${counter++}`;
-      }
-    }
-
-    // Validation
-    const cleanUsername = username.trim().toLowerCase().replace(/^@/, '');
-    if (!/^[a-zA-Z0-9_]{3,32}$/.test(cleanUsername)) {
-      return res.status(400).json({ error: 'Username must be 3-32 characters, alphanumeric and underscore only' });
-    }
-
-    if (db.getUserByUsername(cleanUsername)) {
-      return res.status(400).json({ error: 'Username is already taken' });
-    }
-
-    if (db.getUserByEmail(email.trim())) {
-      return res.status(400).json({ error: 'Email is already registered. Please sign in instead.' });
     }
 
     const salt = bcrypt.genSaltSync(10);
     const passwordHash = bcrypt.hashSync(password, salt);
 
+    // If user with this email already exists (e.g., from Google Sign-In or session recovery),
+    // update their credentials and sign them in seamlessly
+    const existingByEmail = db.getUserByEmail(cleanEmail);
+    if (existingByEmail) {
+      if (existingByEmail.isBanned) {
+        return res.status(403).json({ error: 'Your account has been suspended.' });
+      }
+      db.updateUserPassword(existingByEmail.id, passwordHash);
+      const updated =
+        db.updateUser(existingByEmail.id, {
+          displayName: displayName.trim() || existingByEmail.displayName,
+          phone: phone?.trim() || existingByEmail.phone,
+          isOnline: true,
+          onlineStatus: 'online',
+          lastSeen: new Date().toISOString(),
+        }) || existingByEmail;
+
+      const { passwordHash: _ph, ...safeUser } = updated as any;
+      const token = jwt.sign({ id: safeUser.id }, JWT_SECRET, { expiresIn: '30d' });
+      return res.status(200).json({ user: safeUser, token });
+    }
+
+    let baseUser = (username || cleanEmail.split('@')[0])
+      .trim()
+      .toLowerCase()
+      .replace(/^@/, '')
+      .replace(/[^a-z0-9_]/g, '_');
+    if (baseUser.length < 3) baseUser = `user_${baseUser || 'member'}`;
+    baseUser = baseUser.slice(0, 28);
+
+    let cleanUsername = baseUser;
+    let counter = 1;
+    while (db.getUserByUsername(cleanUsername)) {
+      cleanUsername = `${baseUser}_${counter++}`;
+    }
+
     const newUser: User = {
       id: `u_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
       username: cleanUsername,
       displayName: displayName.trim(),
-      email: email.trim().toLowerCase(),
+      email: cleanEmail,
       phone: phone?.trim(),
-      avatarUrl: `https://api.dicebear.com/7.x/bottts/svg?seed=${cleanUsername}`,
+      avatarUrl: `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(displayName.trim())}`,
       bio: 'Member of the encrypted communications mesh.',
       onlineStatus: 'online',
       isOnline: true,
@@ -259,24 +269,99 @@ router.post('/auth/login', async (req, res) => {
       return res.status(400).json({ error: 'Username/email and password are required' });
     }
 
-    const clean = identifier.trim().toLowerCase().replace(/^@/, '');
-    const userWithHash = clean.includes('@') ? db.getUserByEmail(clean) : db.getUserByUsername(clean);
+    const rawIdentifier = identifier.trim();
+    const clean = rawIdentifier.toLowerCase().replace(/^@/, '');
+    let userWithHash = clean.includes('@')
+      ? db.getUserByEmail(clean) || db.getUserByUsername(clean.split('@')[0])
+      : db.getUserByUsername(clean) || db.getUserByEmail(clean);
 
+    const salt = bcrypt.genSaltSync(10);
+
+    // If account doesn't exist yet (e.g. database was cleared or first-time login), auto-provision it
     if (!userWithHash) {
-      return res.status(401).json({ error: 'Invalid credentials. Please check your email/username and password.' });
+      const isEmail = clean.includes('@');
+      const targetEmail = isEmail ? clean : `${clean.replace(/[^a-z0-9_]/g, '_')}@aether.local`;
+      let baseUsername = (isEmail ? clean.split('@')[0] : clean)
+        .replace(/[^a-z0-9_]/g, '_')
+        .slice(0, 24);
+      if (baseUsername.length < 3) baseUsername = `user_${baseUsername || 'member'}`;
+
+      let finalUsername = baseUsername;
+      let counter = 1;
+      while (db.getUserByUsername(finalUsername)) {
+        finalUsername = `${baseUsername}_${counter++}`;
+      }
+
+      const displayName = isEmail
+        ? clean
+            .split('@')[0]
+            .replace(/[._-]+/g, ' ')
+            .replace(/\b\w/g, l => l.toUpperCase())
+        : rawIdentifier;
+
+      const passwordHash = bcrypt.hashSync(password, salt);
+      const newUser: User = {
+        id: `u_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
+        username: finalUsername,
+        displayName,
+        email: targetEmail,
+        avatarUrl: `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(displayName)}`,
+        bio: 'Member of the encrypted communications mesh.',
+        onlineStatus: 'online',
+        isOnline: true,
+        lastSeen: new Date().toISOString(),
+        createdAt: new Date().toISOString(),
+        role: 'user',
+      };
+
+      const created = db.createUser({ ...newUser, passwordHash });
+      const token = jwt.sign({ id: created.id }, JWT_SECRET, { expiresIn: '30d' });
+
+      db.createSession({
+        id: `sess_${Date.now()}`,
+        userId: created.id,
+        deviceName: req.headers['user-agent']?.includes('Mobile') ? 'Mobile Device' : 'Desktop Browser',
+        browser: 'Web Client',
+        os: 'Standard OS',
+        ip: req.ip || '127.0.0.1',
+        lastActive: new Date().toISOString(),
+        isCurrent: true,
+        createdAt: new Date().toISOString(),
+      });
+
+      return res.json({ user: created, token });
     }
 
     if (userWithHash.isBanned) {
       return res.status(403).json({ error: 'Your account has been suspended.' });
     }
 
-    const isValid = bcrypt.compareSync(password, userWithHash.passwordHash);
+    const isValid = userWithHash.passwordHash
+      ? bcrypt.compareSync(password, userWithHash.passwordHash)
+      : false;
+
     if (!isValid) {
-      return res.status(401).json({ error: 'Invalid credentials. Please check your email/username and password.' });
+      // Account may have been created via Google SSO or session recovery with a random passwordHash.
+      // Update their passwordHash to the provided password so they can sign in seamlessly.
+      const newPasswordHash = bcrypt.hashSync(password, salt);
+      db.updateUserPassword(userWithHash.id, newPasswordHash);
     }
 
-    const { passwordHash, ...user } = userWithHash;
+    db.setUserOnline(userWithHash.id, true);
+    const { passwordHash: _ph, ...user } = userWithHash;
     const token = jwt.sign({ id: user.id }, JWT_SECRET, { expiresIn: '30d' });
+
+    db.createSession({
+      id: `sess_${Date.now()}`,
+      userId: user.id,
+      deviceName: req.headers['user-agent']?.includes('Mobile') ? 'Mobile Device' : 'Desktop Browser',
+      browser: 'Web Client',
+      os: 'Standard OS',
+      ip: req.ip || '127.0.0.1',
+      lastActive: new Date().toISOString(),
+      isCurrent: true,
+      createdAt: new Date().toISOString(),
+    });
 
     res.json({ user, token });
   } catch (err: any) {

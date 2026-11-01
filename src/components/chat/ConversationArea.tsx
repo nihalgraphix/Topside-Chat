@@ -227,6 +227,13 @@ export const ConversationArea: React.FC<ConversationAreaProps> = ({
     }
   }, [conversation?.id, messages.length, onMarkAsRead]);
 
+  // Deduplicate incoming messages by id so React never encounters duplicate keys
+  const uniqueMessages: Message[] = Array.from(
+    new Map<string, Message>(
+      messages.filter((m): m is Message => Boolean(m && m.id)).map(m => [m.id, m])
+    ).values()
+  );
+
   // Determine the effective read status of an individual message based on the current state of messages in the conversation
   const getMessageEffectiveStatus = (
     msg: Message,
@@ -412,7 +419,7 @@ export const ConversationArea: React.FC<ConversationAreaProps> = ({
       // Handle message update
       api.editMessage(editingMessage.id, inputText.trim()).then(updated => {
         if (onUpdateMessages) {
-          onUpdateMessages(messages.map(m => (m.id === updated.id ? updated : m)));
+          onUpdateMessages(uniqueMessages.map(m => (m.id === updated.id ? updated : m)));
         }
       });
       setEditingMessage(null);
@@ -524,7 +531,7 @@ export const ConversationArea: React.FC<ConversationAreaProps> = ({
       });
       if (res.transcription && onUpdateMessages) {
         onUpdateMessages(
-          messages.map(m =>
+          uniqueMessages.map(m =>
             m.id === msg.id ? { ...m, transcription: res.transcription } : m
           )
         );
@@ -618,7 +625,7 @@ export const ConversationArea: React.FC<ConversationAreaProps> = ({
     // Optimistic toggle
     if (onUpdateMessages) {
       onUpdateMessages(
-        messages.map(m => {
+        uniqueMessages.map(m => {
           if (m.id !== msgId) return m;
           const currentReactions = m.reactions ? [...m.reactions] : [];
           const existingIdx = currentReactions.findIndex(
@@ -644,7 +651,7 @@ export const ConversationArea: React.FC<ConversationAreaProps> = ({
     try {
       const updated = await api.reactToMessage(msgId, emoji);
       if (onUpdateMessages && updated) {
-        onUpdateMessages(messages.map(m => (m.id === updated.id ? updated : m)));
+        onUpdateMessages(uniqueMessages.map(m => (m.id === updated.id ? updated : m)));
       }
     } catch (err) {
       console.error('Failed to react', err);
@@ -662,7 +669,7 @@ export const ConversationArea: React.FC<ConversationAreaProps> = ({
     try {
       const updated = await api.togglePinMessage(msgId);
       if (onUpdateMessages) {
-        onUpdateMessages(messages.map(m => (m.id === updated.id ? updated : m)));
+        onUpdateMessages(uniqueMessages.map(m => (m.id === updated.id ? updated : m)));
       }
     } catch (err) {
       console.error('Failed to pin message', err);
@@ -674,7 +681,7 @@ export const ConversationArea: React.FC<ConversationAreaProps> = ({
     try {
       await api.deleteMessage(msgId, forEveryone);
       if (onUpdateMessages) {
-        onUpdateMessages(messages.filter(m => m.id !== msgId));
+        onUpdateMessages(uniqueMessages.filter(m => m.id !== msgId));
       }
     } catch (err) {
       console.error('Failed to delete message', err);
@@ -763,7 +770,7 @@ export const ConversationArea: React.FC<ConversationAreaProps> = ({
     try {
       const updated = await api.votePoll(messageId, optionId);
       if (onUpdateMessages) {
-        onUpdateMessages(messages.map(m => (m.id === updated.id ? updated : m)));
+        onUpdateMessages(uniqueMessages.map(m => (m.id === updated.id ? updated : m)));
       }
     } catch (err) {
       console.error('Failed to vote', err);
@@ -799,13 +806,13 @@ export const ConversationArea: React.FC<ConversationAreaProps> = ({
   const isTyping = typingUsers[conversation.id];
 
   // Check for pinned message
-  const pinnedMessage = messages.find(m => m.isPinned);
+  const pinnedMessage = uniqueMessages.find(m => m.isPinned);
 
   // Search filter and highlight helpers
   const normalizedQuery = searchQuery.trim().toLowerCase();
 
   const filteredMessages = normalizedQuery
-    ? messages.filter(msg => {
+    ? uniqueMessages.filter(msg => {
         if (msg.content && msg.content.toLowerCase().includes(normalizedQuery)) return true;
         if (msg.poll) {
           if (msg.poll.question?.toLowerCase().includes(normalizedQuery)) return true;
@@ -821,7 +828,7 @@ export const ConversationArea: React.FC<ConversationAreaProps> = ({
         if (msg.transcription && msg.transcription.toLowerCase().includes(normalizedQuery)) return true;
         return false;
       })
-    : messages;
+    : uniqueMessages;
 
   const highlightMatches = (text: string, query: string) => {
     if (!text) return text;
@@ -1253,7 +1260,7 @@ export const ConversationArea: React.FC<ConversationAreaProps> = ({
           const isHovered = hoveredMessageId === msg.id;
 
           return (
-            <React.Fragment key={msg.id}>
+            <React.Fragment key={`${msg.id}-${index}`}>
               {showDateHeader && (
                 <div className="flex justify-center my-4">
                   <span className="px-3 py-1 rounded-full bg-white/5 border border-white/10 text-[11px] text-neutral-400 font-medium">

@@ -43,9 +43,15 @@ export const InfoPanel: React.FC<InfoPanelProps> = ({
   const [isMuted, setIsMuted] = useState(conversation.isMuted || false);
   const [disappearingTime, setDisappearingTime] = useState<string>('Off');
 
-  const mediaMessages = messages.filter(m => m.type === 'image' || m.type === 'video');
-  const fileMessages = messages.filter(m => m.type === 'document');
-  const audioMessages = messages.filter(m => m.type === 'voice' || m.type === 'audio');
+  const uniqueMessages: Message[] = Array.from(
+    new Map<string, Message>(
+      messages.filter((m): m is Message => Boolean(m && m.id)).map(m => [m.id, m])
+    ).values()
+  );
+
+  const mediaMessages = uniqueMessages.filter(m => m.type === 'image' || m.type === 'video');
+  const fileMessages = uniqueMessages.filter(m => m.type === 'document');
+  const audioMessages = uniqueMessages.filter(m => m.type === 'voice' || m.type === 'audio');
 
   const handleToggleMute = async () => {
     const res = await api.toggleMuteConversation(conversation.id);

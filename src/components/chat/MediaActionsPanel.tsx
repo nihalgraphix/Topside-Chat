@@ -45,14 +45,21 @@ export const MediaActionsPanel: React.FC<MediaActionsPanelProps> = ({
   const [contactName, setContactName] = useState('');
   const [contactPhone, setContactPhone] = useState('');
 
-  // Shared photos from the actual conversation messages
-  const sharedPhotos = messages
-    .filter(m => m.type === 'image' && m.mediaUrl)
-    .map(m => ({
-      id: m.id,
-      title: m.content || 'Shared photo',
-      thumbnail: m.mediaUrl!,
-    }));
+  // Shared photos from the actual conversation messages (deduplicated by id)
+  const sharedPhotos: Array<{ id: string; title: string; thumbnail: string }> = Array.from(
+    new Map<string, { id: string; title: string; thumbnail: string }>(
+      messages
+        .filter((m): m is Message => Boolean(m && m.id && m.type === 'image' && m.mediaUrl))
+        .map(m => [
+          m.id,
+          {
+            id: m.id,
+            title: m.content || 'Shared photo',
+            thumbnail: m.mediaUrl!,
+          },
+        ])
+    ).values()
+  );
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];

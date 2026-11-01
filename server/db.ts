@@ -303,16 +303,30 @@ class AetherDatabase {
 
         parsed.users = (parsed.users || []).filter((u: any) => !DEMO_USER_IDS.has(u.id));
         parsed.sessions = (parsed.sessions || []).filter((s: any) => !DEMO_USER_IDS.has(s.userId));
-        parsed.conversations = (parsed.conversations || []).filter(
-          (c: any) => c.type !== 'channel' && !isDemoConversation(c.id)
-        );
+        const convById = new Map<string, Conversation>();
+        for (const c of parsed.conversations || []) {
+          if (c && c.id && c.type !== 'channel' && !isDemoConversation(c.id)) {
+            convById.set(c.id, c);
+          }
+        }
+        parsed.conversations = Array.from(convById.values());
         const validConvIds = new Set(parsed.conversations.map((c: any) => c.id));
-        parsed.conversationMembers = (parsed.conversationMembers || []).filter(
-          (m: any) => !DEMO_USER_IDS.has(m.userId) && validConvIds.has(m.conversationId)
-        );
-        parsed.messages = (parsed.messages || []).filter(
-          (m: any) => !DEMO_USER_IDS.has(m.senderId) && validConvIds.has(m.conversationId)
-        );
+
+        const memByKey = new Map<string, ConversationMember>();
+        for (const m of parsed.conversationMembers || []) {
+          if (m && !DEMO_USER_IDS.has(m.userId) && validConvIds.has(m.conversationId)) {
+            memByKey.set(`${m.conversationId}_${m.userId}`, m);
+          }
+        }
+        parsed.conversationMembers = Array.from(memByKey.values());
+
+        const msgById = new Map<string, Message>();
+        for (const m of parsed.messages || []) {
+          if (m && m.id && !DEMO_USER_IDS.has(m.senderId) && validConvIds.has(m.conversationId)) {
+            msgById.set(m.id, m);
+          }
+        }
+        parsed.messages = Array.from(msgById.values());
         parsed.stories = (parsed.stories || []).filter(
           (s: any) => !DEMO_USER_IDS.has(s.userId) && !String(s.id).startsWith('st_seed_') && s.id !== 'st_1' && s.id !== 'st_2'
         );
@@ -761,12 +775,16 @@ class AetherDatabase {
 
   // --- Messages API ---
   public getMessages(conversationId: string): Message[] {
-    return this.data.messages
-      .filter(m => m.conversationId === conversationId && !m.isDeletedForEveryone)
-      .map(m => ({
-        ...m,
-        sender: this.getUserById(m.senderId),
-      }));
+    const byId = new Map<string, Message>();
+    for (const m of this.data.messages) {
+      if (m && m.id && m.conversationId === conversationId && !m.isDeletedForEveryone) {
+        byId.set(m.id, {
+          ...m,
+          sender: this.getUserById(m.senderId),
+        });
+      }
+    }
+    return Array.from(byId.values());
   }
 
   public getMessageById(messageId: string): Message | undefined {
@@ -780,7 +798,12 @@ class AetherDatabase {
 
   public createMessage(msgData: Omit<Message, 'id' | 'createdAt' | 'reactions' | 'status'> & { id?: string }): Message {
     const now = new Date().toISOString();
-    const id = msgData.id || `m_${Date.now()}_${Math.random().toString(36).substr(2, 7)}`;
+    let id = msgData.id || `m_${Date.now()}_${Math.random().toString(36).substr(2, 7)}`;
+    if (!msgData.id) {
+      while (this.data.messages.some(m => m.id === id)) {
+        id = `m_${Date.now()}_${Math.random().toString(36).substr(2, 7)}`;
+      }
+    }
 
     let replyTo: Message['replyTo'] | undefined;
     if (msgData.replyToId) {
@@ -805,7 +828,12 @@ class AetherDatabase {
       replyTo,
     };
 
-    this.data.messages.push(newMsg);
+    const existingIdx = this.data.messages.findIndex(m => m.id === id);
+    if (existingIdx >= 0) {
+      this.data.messages[existingIdx] = newMsg;
+    } else {
+      this.data.messages.push(newMsg);
+    }
     this.queueSave();
     try {
       sqlStorage.saveMessage(newMsg);

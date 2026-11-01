@@ -778,10 +778,14 @@ router.post('/conversations/:id/messages', authenticate, (req: AuthRequest, res)
   });
 
   // Broadcast the created message to all other participants in the conversation
-  AetherSocketServer.instance?.broadcastToConversation(req.params.id, {
-    type: 'message:new',
-    message: created,
-  });
+  AetherSocketServer.instance?.broadcastToConversation(
+    req.params.id,
+    {
+      type: 'message:new',
+      message: created,
+    },
+    req.user!.id
+  );
 
   res.status(201).json({ message: created });
 });

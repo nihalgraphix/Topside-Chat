@@ -35,7 +35,7 @@ service cloud.firestore {
         && (!('appUserId' in data) || (data.appUserId is string && data.appUserId.size() >= 1 && data.appUserId.size() <= 128 && isValidId(data.appUserId)))
         && data.username is string && data.username.size() >= 2 && data.username.size() <= 32 && data.username.matches('^[a-zA-Z0-9_]+$')
         && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 64
-        && (!('avatarUrl' in data) || (data.avatarUrl is string && data.avatarUrl.size() <= 1024))
+        && (!('avatarUrl' in data) || (data.avatarUrl is string && data.avatarUrl.size() <= 2048))
         && (!('bio' in data) || (data.bio is string && data.bio.size() <= 256))
         && data.isOnline is bool
         && data.createdAt is timestamp
@@ -59,6 +59,67 @@ service cloud.firestore {
         && data.content is string && data.content.size() >= 1 && data.content.size() <= 4000
         && (!('tag' in data) || (data.tag is string && data.tag.size() <= 32))
         && data.isPinned is bool
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidCloudConversation(data, userId, conversationId) {
+      return data.keys().hasAll(['ownerId', 'convId', 'type', 'name', 'memberIds', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['ownerId', 'convId', 'type', 'name', 'description', 'avatarUrl', 'lastMessageText', 'memberIds', 'createdAt', 'updatedAt'])
+        && data.ownerId is string && data.ownerId.size() >= 1 && data.ownerId.size() <= 128 && data.ownerId == userId && data.ownerId == request.auth.uid
+        && data.convId is string && data.convId == conversationId && isValidId(data.convId)
+        && (data.type == 'direct' || data.type == 'group')
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 128
+        && (!('description' in data) || (data.description is string && data.description.size() <= 512))
+        && (!('avatarUrl' in data) || (data.avatarUrl is string && data.avatarUrl.size() <= 2048))
+        && (!('lastMessageText' in data) || (data.lastMessageText is string && data.lastMessageText.size() <= 1000))
+        && data.memberIds is list && data.memberIds.size() <= 50
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidCloudMessage(data, userId, messageId) {
+      return data.keys().hasAll(['ownerId', 'msgId', 'conversationId', 'senderId', 'senderName', 'content', 'type', 'status', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['ownerId', 'msgId', 'conversationId', 'senderId', 'senderName', 'content', 'type', 'mediaUrl', 'fileName', 'status', 'createdAt', 'updatedAt'])
+        && data.ownerId is string && data.ownerId.size() >= 1 && data.ownerId.size() <= 128 && data.ownerId == userId && data.ownerId == request.auth.uid
+        && data.msgId is string && data.msgId == messageId && isValidId(data.msgId)
+        && data.conversationId is string && isValidId(data.conversationId)
+        && data.senderId is string && isValidId(data.senderId)
+        && data.senderName is string && data.senderName.size() >= 1 && data.senderName.size() <= 64
+        && data.content is string && data.content.size() <= 4000
+        && data.type is string && data.type.size() >= 1 && data.type.size() <= 32
+        && (!('mediaUrl' in data) || (data.mediaUrl is string && data.mediaUrl.size() <= 200000))
+        && (!('fileName' in data) || (data.fileName is string && data.fileName.size() <= 256))
+        && (data.status == 'sending' || data.status == 'sent' || data.status == 'delivered' || data.status == 'read')
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidCloudFile(data, userId, fileId) {
+      return data.keys().hasAll(['ownerId', 'fileId', 'fileName', 'mimeType', 'sizeBytes', 'dataUrl', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['ownerId', 'fileId', 'fileName', 'mimeType', 'sizeBytes', 'dataUrl', 'createdAt', 'updatedAt'])
+        && data.ownerId is string && data.ownerId.size() >= 1 && data.ownerId.size() <= 128 && data.ownerId == userId && data.ownerId == request.auth.uid
+        && data.fileId is string && data.fileId == fileId && isValidId(data.fileId)
+        && data.fileName is string && data.fileName.size() >= 1 && data.fileName.size() <= 256
+        && data.mimeType is string && data.mimeType.size() >= 1 && data.mimeType.size() <= 128
+        && data.sizeBytes is int && data.sizeBytes >= 0 && data.sizeBytes <= 5000000
+        && data.dataUrl is string && data.dataUrl.size() >= 1 && data.dataUrl.size() <= 750000
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidCloudStory(data, storyId) {
+      return data.keys().hasAll(['authorUid', 'storyId', 'authorId', 'authorName', 'type', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['authorUid', 'storyId', 'authorId', 'authorName', 'authorAvatar', 'type', 'text', 'mediaUrl', 'background', 'createdAt', 'updatedAt'])
+        && data.authorUid is string && data.authorUid.size() >= 1 && data.authorUid.size() <= 128 && data.authorUid == request.auth.uid
+        && data.storyId is string && data.storyId == storyId && isValidId(data.storyId)
+        && data.authorId is string && isValidId(data.authorId)
+        && data.authorName is string && data.authorName.size() >= 1 && data.authorName.size() <= 64
+        && (!('authorAvatar' in data) || (data.authorAvatar is string && data.authorAvatar.size() <= 2048))
+        && (data.type == 'text' || data.type == 'image')
+        && (!('text' in data) || (data.text is string && data.text.size() <= 1000))
+        && (!('mediaUrl' in data) || (data.mediaUrl is string && data.mediaUrl.size() <= 200000))
+        && (!('background' in data) || (data.background is string && data.background.size() <= 128))
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
     }
@@ -136,6 +197,119 @@ service cloud.firestore {
           && isValidId(noteId)
           && existing().ownerId == request.auth.uid;
       }
+
+      match /conversations/{conversationId} {
+        allow get: if isOwner(userId) && isValidId(userId) && isValidId(conversationId) && existing().ownerId == request.auth.uid;
+        allow list: if isOwner(userId) && existing().ownerId == request.auth.uid;
+
+        allow create: if isOwner(userId)
+          && isValidId(userId)
+          && isValidId(conversationId)
+          && isValidCloudConversation(incoming(), userId, conversationId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && get(/databases/$(database)/documents/users/$(userId)).data.uid == request.auth.uid;
+
+        allow update: if isOwner(userId)
+          && isValidId(userId)
+          && isValidId(conversationId)
+          && isValidCloudConversation(incoming(), userId, conversationId)
+          && incoming().ownerId == existing().ownerId
+          && incoming().convId == existing().convId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'description', 'avatarUrl', 'lastMessageText', 'memberIds', 'updatedAt'])
+          && get(/databases/$(database)/documents/users/$(userId)).data.uid == request.auth.uid;
+
+        allow delete: if isOwner(userId)
+          && isValidId(userId)
+          && isValidId(conversationId)
+          && existing().ownerId == request.auth.uid;
+      }
+
+      match /messages/{messageId} {
+        allow get: if isOwner(userId) && isValidId(userId) && isValidId(messageId) && existing().ownerId == request.auth.uid;
+        allow list: if isOwner(userId) && existing().ownerId == request.auth.uid;
+
+        allow create: if isOwner(userId)
+          && isValidId(userId)
+          && isValidId(messageId)
+          && isValidCloudMessage(incoming(), userId, messageId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && get(/databases/$(database)/documents/users/$(userId)).data.uid == request.auth.uid;
+
+        allow update: if isOwner(userId)
+          && isValidId(userId)
+          && isValidId(messageId)
+          && isValidCloudMessage(incoming(), userId, messageId)
+          && incoming().ownerId == existing().ownerId
+          && incoming().msgId == existing().msgId
+          && incoming().conversationId == existing().conversationId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly(['content', 'status', 'updatedAt'])
+          && get(/databases/$(database)/documents/users/$(userId)).data.uid == request.auth.uid;
+
+        allow delete: if isOwner(userId)
+          && isValidId(userId)
+          && isValidId(messageId)
+          && existing().ownerId == request.auth.uid;
+      }
+
+      match /files/{fileId} {
+        allow get: if isOwner(userId) && isValidId(userId) && isValidId(fileId) && existing().ownerId == request.auth.uid;
+        allow list: if isOwner(userId) && existing().ownerId == request.auth.uid;
+
+        allow create: if isOwner(userId)
+          && isValidId(userId)
+          && isValidId(fileId)
+          && isValidCloudFile(incoming(), userId, fileId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && get(/databases/$(database)/documents/users/$(userId)).data.uid == request.auth.uid;
+
+        allow update: if isOwner(userId)
+          && isValidId(userId)
+          && isValidId(fileId)
+          && isValidCloudFile(incoming(), userId, fileId)
+          && incoming().ownerId == existing().ownerId
+          && incoming().fileId == existing().fileId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly(['fileName', 'updatedAt'])
+          && get(/databases/$(database)/documents/users/$(userId)).data.uid == request.auth.uid;
+
+        allow delete: if isOwner(userId)
+          && isValidId(userId)
+          && isValidId(fileId)
+          && existing().ownerId == request.auth.uid;
+      }
+    }
+
+    match /stories/{storyId} {
+      allow get: if isSignedIn() && isValidId(storyId) && existing().storyId == storyId;
+      allow list: if isSignedIn() && existing().type is string;
+
+      allow create: if isSignedIn()
+        && isValidId(storyId)
+        && isValidCloudStory(incoming(), storyId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isSignedIn()
+        && isValidId(storyId)
+        && existing().authorUid == request.auth.uid
+        && isValidCloudStory(incoming(), storyId)
+        && incoming().authorUid == existing().authorUid
+        && incoming().storyId == existing().storyId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly(['text', 'mediaUrl', 'background', 'updatedAt']);
+
+      allow delete: if isSignedIn()
+        && isValidId(storyId)
+        && existing().authorUid == request.auth.uid;
     }
   }
 }

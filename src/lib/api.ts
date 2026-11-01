@@ -1,5 +1,18 @@
 import { User, Conversation, Message, Story, Call, UserSettings, DeviceSession, ChatFolder, AdminStats, Report, BlockedUser } from '../types';
-import { syncUserToCloudDirectory, fetchCloudDirectoryUsers } from './firebase';
+import {
+  syncUserToCloudDirectory,
+  fetchCloudDirectoryUsers,
+  signOutFirebaseSession,
+  syncConversationToFirestore,
+  fetchConversationsFromFirestore,
+  syncMessageToFirestore,
+  deleteMessageFromFirestore,
+  fetchMessagesFromFirestore,
+  uploadFileToFirestore,
+  syncStoryToFirestore,
+  deleteStoryFromFirestore,
+  fetchStoriesFromFirestore,
+} from './firebase';
 
 const REMOTE_API_ORIGIN = 'https://ais-pre-jpz57iqlur4hyo5s2f2gkp-455372508405.asia-southeast1.run.app';
 
@@ -48,6 +61,7 @@ class ApiClient {
 
   public logout() {
     this.setSession(null, null);
+    void signOutFirebaseSession();
   }
 
   private isRefreshing = false;
@@ -66,10 +80,25 @@ class ApiClient {
       const raw = localStorage.getItem('aether_client_db');
       if (raw) {
         const parsed = JSON.parse(raw);
+        const rawMessages: Record<string, Message[]> = parsed.messages || {};
+        const dedupedMessages: Record<string, Message[]> = {};
+        for (const [convId, list] of Object.entries(rawMessages)) {
+          if (Array.isArray(list)) {
+            const byId = new Map<string, Message>();
+            for (const m of list) {
+              if (m && m.id) byId.set(m.id, m);
+            }
+            dedupedMessages[convId] = Array.from(byId.values());
+          }
+        }
+        const convById = new Map<string, Conversation>();
+        for (const c of Array.isArray(parsed.conversations) ? parsed.conversations : []) {
+          if (c && c.id) convById.set(c.id, c);
+        }
         return {
           users: parsed.users || [],
-          conversations: parsed.conversations || [],
-          messages: parsed.messages || {},
+          conversations: Array.from(convById.values()),
+          messages: dedupedMessages,
           stories: parsed.stories || [],
           calls: parsed.calls || [],
         };
@@ -880,18 +909,43 @@ class ApiClient {
 
   // Conversations
   public async getConversations(): Promise<Conversation[]> {
-    const res = await this.request<{ conversations: Conversation[] }>('/conversations');
-    const convs = res.conversations || [];
+    const currentUser = this.getStoredUser();
+    const localDb = this.getClientDb();
+    const [res, cloudConvs] = await Promise.all([
+      this.request<{ conversations: Conversation[] }>('/conversations').catch(() => ({
+        conversations: [] as Conversation[],
+      })),
+      fetchConversationsFromFirestore(currentUser, localDb.users).catch(() => [] as Conversation[]),
+    ]);
+
+    const rawConvs = [...(res.conversations || []), ...cloudConvs];
+    const convById = new Map<string, Conversation>();
     const memberUsers: User[] = [];
-    for (const c of convs) {
+    for (const c of rawConvs) {
+      if (!c || !c.id) continue;
+      const memById = new Map<string, (typeof c.members)[number]>();
       for (const m of c.members || []) {
+        if (!m) continue;
+        const memKey = m.userId || m.id;
+        if (memKey) memById.set(memKey, m);
         if (m.user) memberUsers.push(m.user);
       }
+      const existing = convById.get(c.id);
+      convById.set(c.id, {
+        ...(existing || {}),
+        ...c,
+        members: Array.from(memById.values()),
+        lastMessage: c.lastMessage || existing?.lastMessage,
+      });
     }
     if (memberUsers.length > 0) {
       this.upsertLocalUsers(memberUsers);
     }
-    return convs;
+    const mergedList = Array.from(convById.values());
+    for (const conv of res.conversations || []) {
+      void syncConversationToFirestore(conv, currentUser);
+    }
+    return mergedList;
   }
 
   public async getConversation(id: string): Promise<Conversation> {
@@ -909,6 +963,7 @@ class ApiClient {
     memberIds?: string[];
   }): Promise<Conversation> {
     const db = this.getClientDb();
+    const currentUser = this.getStoredUser();
     const memberUsers = (data.memberIds || [])
       .map(id => db.users.find(u => u.id === id))
       .filter((u): u is User => Boolean(u));
@@ -927,6 +982,9 @@ class ApiClient {
             : 'New Group'),
       }),
     });
+    if (res.conversation) {
+      void syncConversationToFirestore(res.conversation, currentUser);
+    }
     return res.conversation;
   }
 
@@ -938,16 +996,41 @@ class ApiClient {
   }
 
   public async getMessages(conversationId: string): Promise<Message[]> {
-    const res = await this.request<{ messages: Message[] }>(`/conversations/${conversationId}/messages`);
-    return res.messages || [];
+    const localDb = this.getClientDb();
+    const currentUser = this.getStoredUser();
+    const [res, cloudMsgs] = await Promise.all([
+      this.request<{ messages: Message[] }>(`/conversations/${conversationId}/messages`).catch(() => ({
+        messages: [] as Message[],
+      })),
+      fetchMessagesFromFirestore(conversationId, localDb.users).catch(() => [] as Message[]),
+    ]);
+
+    const list = [...cloudMsgs, ...(res.messages || [])];
+    const byId = new Map<string, Message>();
+    for (const msg of list) {
+      if (msg && msg.id) {
+        const prev = byId.get(msg.id);
+        byId.set(msg.id, prev ? { ...prev, ...msg } : msg);
+      }
+    }
+    for (const msg of res.messages || []) {
+      void syncMessageToFirestore(msg, currentUser);
+    }
+    const merged = Array.from(byId.values());
+    merged.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+    return merged;
   }
 
   public async sendMessage(data: { conversationId: string; [key: string]: any }): Promise<Message> {
+    const currentUser = this.getStoredUser();
     const { conversationId, ...body } = data;
     const res = await this.request<{ message: Message }>(`/conversations/${conversationId}/messages`, {
       method: 'POST',
       body: JSON.stringify(body),
     });
+    if (res.message) {
+      void syncMessageToFirestore(res.message, currentUser);
+    }
     return res.message;
   }
 
@@ -968,6 +1051,9 @@ class ApiClient {
       method: 'POST',
       body: JSON.stringify({ userId }),
     });
+    if (res.conversation) {
+      void syncConversationToFirestore(res.conversation, this.getStoredUser());
+    }
     return res.conversation;
   }
 
@@ -977,6 +1063,9 @@ class ApiClient {
       method: 'PATCH',
       body: JSON.stringify({ content }),
     });
+    if (res.message) {
+      void syncMessageToFirestore(res.message, this.getStoredUser());
+    }
     return res.message;
   }
 
@@ -985,6 +1074,7 @@ class ApiClient {
       method: 'DELETE',
       body: JSON.stringify({ forEveryone }),
     });
+    void deleteMessageFromFirestore(messageId);
     return res.success;
   }
 
@@ -1039,8 +1129,15 @@ class ApiClient {
 
   // Stories
   public async getStories(): Promise<Story[]> {
-    const res = await this.request<{ stories: Story[] }>('/stories');
-    return res.stories || [];
+    const [res, cloudStories] = await Promise.all([
+      this.request<{ stories: Story[] }>('/stories').catch(() => ({ stories: [] as Story[] })),
+      fetchStoriesFromFirestore().catch(() => [] as Story[]),
+    ]);
+    const byId = new Map<string, Story>();
+    for (const s of [...cloudStories, ...(res.stories || [])]) {
+      if (s && s.id) byId.set(s.id, s);
+    }
+    return Array.from(byId.values());
   }
 
   public async createStory(data: Partial<Story>): Promise<Story> {
@@ -1048,6 +1145,9 @@ class ApiClient {
       method: 'POST',
       body: JSON.stringify(data),
     });
+    if (res.story) {
+      void syncStoryToFirestore(res.story, this.getStoredUser());
+    }
     return res.story;
   }
 
@@ -1056,6 +1156,9 @@ class ApiClient {
       method: 'PATCH',
       body: JSON.stringify(data),
     });
+    if (res.story) {
+      void syncStoryToFirestore(res.story, this.getStoredUser());
+    }
     return res.story;
   }
 
@@ -1063,6 +1166,7 @@ class ApiClient {
     const res = await this.request<{ success: boolean }>(`/stories/${storyId}`, {
       method: 'DELETE',
     });
+    void deleteStoryFromFirestore(storyId);
     return res.success;
   }
 
@@ -1157,6 +1261,24 @@ class ApiClient {
 
   // Uploads
   public async uploadFile(file: File): Promise<{ url: string; filename: string; size: number; mimetype: string }> {
+    const fileToDataUrl = (f: File): Promise<string> =>
+      new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result || ''));
+        reader.onerror = reject;
+        reader.readAsDataURL(f);
+      });
+
+    let dataUrl = '';
+    try {
+      if (file.size <= 550000) {
+        dataUrl = await fileToDataUrl(file);
+        void uploadFileToFirestore(file, dataUrl, this.getStoredUser());
+      }
+    } catch {
+      // Ignore data URL conversion error
+    }
+
     const formData = new FormData();
     formData.append('file', file);
 
@@ -1165,17 +1287,31 @@ class ApiClient {
       headers['Authorization'] = `Bearer ${this.token}`;
     }
 
-    const response = await fetch('/api/upload', {
-      method: 'POST',
-      headers,
-      body: formData,
-    });
+    try {
+      const response = await fetch('/api/upload', {
+        method: 'POST',
+        headers,
+        body: formData,
+      });
 
-    if (!response.ok) {
-      throw new Error(`Upload failed: ${response.statusText}`);
+      if (response.ok) {
+        return await response.json();
+      }
+    } catch {
+      // Fall back to Firestore / Data URL below
     }
 
-    return response.json();
+    if (!dataUrl) {
+      dataUrl = await fileToDataUrl(file);
+      void uploadFileToFirestore(file, dataUrl, this.getStoredUser());
+    }
+
+    return {
+      url: dataUrl,
+      filename: file.name,
+      size: file.size,
+      mimetype: file.type || 'application/octet-stream',
+    };
   }
 
   // Admin

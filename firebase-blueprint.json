@@ -1,128 +1,452 @@
 {
   "entities": {
     "UserPublicProfile": {
-      "title": "UserPublicProfile",
-      "description": "Publicly visible user profile without PII",
+      "title": "User Public Profile",
+      "description": "Publicly discoverable profile for AetherChat users. Never stores private PII such as email or phone number.",
       "type": "object",
       "properties": {
         "uid": {
           "type": "string",
-          "maxLength": 128,
-          "pattern": "^[a-zA-Z0-9_\\-]+$"
+          "description": "Firebase Auth UID of the user (must match document ID).",
+          "minLength": 1,
+          "maxLength": 128
         },
         "appUserId": {
           "type": "string",
-          "maxLength": 128,
-          "pattern": "^[a-zA-Z0-9_\\-]+$"
+          "description": "Application-level user ID mapped to this profile.",
+          "minLength": 1,
+          "maxLength": 128
         },
         "username": {
           "type": "string",
+          "description": "Unique handle for the user.",
           "minLength": 2,
           "maxLength": 32,
           "pattern": "^[a-zA-Z0-9_]+$"
         },
         "displayName": {
           "type": "string",
+          "description": "Public display name shown in chats and search.",
           "minLength": 1,
           "maxLength": 64
         },
         "avatarUrl": {
           "type": "string",
-          "maxLength": 1024
+          "description": "Avatar image URL.",
+          "minLength": 0,
+          "maxLength": 2048
         },
         "bio": {
           "type": "string",
+          "description": "Short public biography or status message.",
+          "minLength": 0,
           "maxLength": 256
         },
         "isOnline": {
-          "type": "boolean"
+          "type": "boolean",
+          "description": "Whether the user is currently active."
         },
         "createdAt": {
           "type": "string",
-          "format": "date-time"
+          "format": "date-time",
+          "description": "Server timestamp when the profile was created."
         },
         "updatedAt": {
           "type": "string",
-          "format": "date-time"
+          "format": "date-time",
+          "description": "Server timestamp when the profile was last updated."
         }
       },
       "required": ["uid", "username", "displayName", "isOnline", "createdAt", "updatedAt"]
     },
     "UserPrivateInfo": {
-      "title": "UserPrivateInfo",
-      "description": "Isolated PII for a user (email, phone)",
+      "title": "User Private Info",
+      "description": "Strictly private user account metadata (email, phone) accessible only by the owner.",
       "type": "object",
       "properties": {
         "uid": {
           "type": "string",
-          "maxLength": 128,
-          "pattern": "^[a-zA-Z0-9_\\-]+$"
+          "description": "Firebase Auth UID of the owner.",
+          "minLength": 1,
+          "maxLength": 128
         },
         "email": {
           "type": "string",
+          "description": "Private email address of the user.",
+          "minLength": 3,
           "maxLength": 128
         },
         "phone": {
           "type": "string",
+          "description": "Optional private phone number.",
+          "minLength": 0,
           "maxLength": 32
         },
         "createdAt": {
           "type": "string",
-          "format": "date-time"
+          "format": "date-time",
+          "description": "Server timestamp when private info was created."
         },
         "updatedAt": {
           "type": "string",
-          "format": "date-time"
+          "format": "date-time",
+          "description": "Server timestamp when private info was last updated."
         }
       },
       "required": ["uid", "email", "createdAt", "updatedAt"]
     },
     "CloudNote": {
-      "title": "CloudNote",
-      "description": "Encrypted personal note or saved message synced to Firestore",
+      "title": "Cloud Saved Note",
+      "description": "Personal encrypted cloud note or saved message snippet belonging to a user.",
       "type": "object",
       "properties": {
         "ownerId": {
           "type": "string",
-          "maxLength": 128,
-          "pattern": "^[a-zA-Z0-9_\\-]+$"
+          "description": "Firebase Auth UID of the note owner.",
+          "minLength": 1,
+          "maxLength": 128
         },
         "content": {
           "type": "string",
+          "description": "Text content of the saved note.",
           "minLength": 1,
           "maxLength": 4000
         },
         "tag": {
           "type": "string",
+          "description": "Optional category tag.",
+          "minLength": 0,
           "maxLength": 32
         },
         "isPinned": {
-          "type": "boolean"
+          "type": "boolean",
+          "description": "Whether the note is pinned."
         },
         "createdAt": {
           "type": "string",
-          "format": "date-time"
+          "format": "date-time",
+          "description": "Server timestamp when the note was created."
         },
         "updatedAt": {
           "type": "string",
-          "format": "date-time"
+          "format": "date-time",
+          "description": "Server timestamp when the note was last updated."
         }
       },
       "required": ["ownerId", "content", "isPinned", "createdAt", "updatedAt"]
+    },
+    "CloudConversation": {
+      "title": "Cloud Conversation Record",
+      "description": "Stored conversation metadata persisted in Firestore for a user.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "description": "Firebase Auth UID of the user who owns this conversation record.",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "convId": {
+          "type": "string",
+          "description": "Application conversation ID.",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "type": {
+          "type": "string",
+          "description": "Conversation type (direct or group).",
+          "enum": ["direct", "group"]
+        },
+        "name": {
+          "type": "string",
+          "description": "Conversation title or recipient name.",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "description": {
+          "type": "string",
+          "description": "Optional conversation description.",
+          "minLength": 0,
+          "maxLength": 512
+        },
+        "avatarUrl": {
+          "type": "string",
+          "description": "Optional avatar URL for the conversation.",
+          "minLength": 0,
+          "maxLength": 2048
+        },
+        "lastMessageText": {
+          "type": "string",
+          "description": "Preview text of the latest message.",
+          "minLength": 0,
+          "maxLength": 1000
+        },
+        "memberIds": {
+          "type": "array",
+          "description": "List of participant user IDs.",
+          "maxItems": 50,
+          "items": {
+            "type": "string"
+          }
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when last updated."
+        }
+      },
+      "required": ["ownerId", "convId", "type", "name", "memberIds", "createdAt", "updatedAt"]
+    },
+    "CloudMessage": {
+      "title": "Cloud Message Record",
+      "description": "Stored chat message persisted in Firestore for a user.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "description": "Firebase Auth UID of the user storing this message.",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "msgId": {
+          "type": "string",
+          "description": "Application message ID.",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "conversationId": {
+          "type": "string",
+          "description": "Application conversation ID.",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "senderId": {
+          "type": "string",
+          "description": "Sender user ID.",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "senderName": {
+          "type": "string",
+          "description": "Display name of the sender.",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "content": {
+          "type": "string",
+          "description": "Message text body.",
+          "minLength": 0,
+          "maxLength": 4000
+        },
+        "type": {
+          "type": "string",
+          "description": "Message content type.",
+          "minLength": 1,
+          "maxLength": 32
+        },
+        "mediaUrl": {
+          "type": "string",
+          "description": "Optional media attachment URL or data URI.",
+          "minLength": 0,
+          "maxLength": 200000
+        },
+        "fileName": {
+          "type": "string",
+          "description": "Optional attachment file name.",
+          "minLength": 0,
+          "maxLength": 256
+        },
+        "status": {
+          "type": "string",
+          "description": "Delivery status (sent, delivered, read).",
+          "enum": ["sending", "sent", "delivered", "read"]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when stored."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when updated."
+        }
+      },
+      "required": ["ownerId", "msgId", "conversationId", "senderId", "senderName", "content", "type", "status", "createdAt", "updatedAt"]
+    },
+    "CloudFile": {
+      "title": "Cloud Stored File",
+      "description": "User media or attachment stored in Firestore cloud storage.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "description": "Firebase Auth UID of the uploader.",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "fileId": {
+          "type": "string",
+          "description": "Unique file identifier.",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "fileName": {
+          "type": "string",
+          "description": "Original file name.",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "mimeType": {
+          "type": "string",
+          "description": "MIME type of the file.",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "sizeBytes": {
+          "type": "integer",
+          "description": "Size of the file in bytes.",
+          "minimum": 0,
+          "maximum": 5000000
+        },
+        "dataUrl": {
+          "type": "string",
+          "description": "Encoded file data URL or remote storage URL.",
+          "minLength": 1,
+          "maxLength": 750000
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when uploaded."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when updated."
+        }
+      },
+      "required": ["ownerId", "fileId", "fileName", "mimeType", "sizeBytes", "dataUrl", "createdAt", "updatedAt"]
+    },
+    "CloudStory": {
+      "title": "Cloud Story",
+      "description": "Ephemeral 24-hour story shared with authenticated users.",
+      "type": "object",
+      "properties": {
+        "authorUid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the story creator.",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "storyId": {
+          "type": "string",
+          "description": "Application story ID.",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "authorId": {
+          "type": "string",
+          "description": "Application user ID of the creator.",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "authorName": {
+          "type": "string",
+          "description": "Display name of the story creator.",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "authorAvatar": {
+          "type": "string",
+          "description": "Optional avatar URL of the creator.",
+          "minLength": 0,
+          "maxLength": 2048
+        },
+        "type": {
+          "type": "string",
+          "description": "Story format (text or image).",
+          "enum": ["text", "image"]
+        },
+        "text": {
+          "type": "string",
+          "description": "Story text caption.",
+          "minLength": 0,
+          "maxLength": 1000
+        },
+        "mediaUrl": {
+          "type": "string",
+          "description": "Optional story media URL.",
+          "minLength": 0,
+          "maxLength": 200000
+        },
+        "background": {
+          "type": "string",
+          "description": "Background color or gradient string.",
+          "minLength": 0,
+          "maxLength": 128
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when story was posted."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when story was updated."
+        }
+      },
+      "required": ["authorUid", "storyId", "authorId", "authorName", "type", "createdAt", "updatedAt"]
     }
   },
   "firestore": {
     "/users/{userId}": {
-      "schema": { "$ref": "#/entities/UserPublicProfile" },
-      "description": "Public profile for each registered user"
+      "schema": {
+        "$ref": "#/entities/UserPublicProfile"
+      },
+      "description": "Publicly readable directory of user profiles (no PII)."
     },
     "/users/{userId}/private/{docId}": {
-      "schema": { "$ref": "#/entities/UserPrivateInfo" },
-      "description": "Isolated PII (email, phone) strictly readable and writable by owner"
+      "schema": {
+        "$ref": "#/entities/UserPrivateInfo"
+      },
+      "description": "Owner-only private user account details (email, phone)."
     },
     "/users/{userId}/notes/{noteId}": {
-      "schema": { "$ref": "#/entities/CloudNote" },
-      "description": "User's private cloud notes and saved messages"
+      "schema": {
+        "$ref": "#/entities/CloudNote"
+      },
+      "description": "Owner-only personal cloud notes and saved items."
+    },
+    "/users/{userId}/conversations/{conversationId}": {
+      "schema": {
+        "$ref": "#/entities/CloudConversation"
+      },
+      "description": "Owner-only persisted conversations metadata."
+    },
+    "/users/{userId}/messages/{messageId}": {
+      "schema": {
+        "$ref": "#/entities/CloudMessage"
+      },
+      "description": "Owner-only persisted chat messages."
+    },
+    "/users/{userId}/files/{fileId}": {
+      "schema": {
+        "$ref": "#/entities/CloudFile"
+      },
+      "description": "Owner-only uploaded files and media attachments."
+    },
+    "/stories/{storyId}": {
+      "schema": {
+        "$ref": "#/entities/CloudStory"
+      },
+      "description": "Shared stories visible to authenticated users and writable by their author."
     }
   }
 }

@@ -2,8 +2,7 @@ import React, { useState } from 'react';
 import { motion } from 'motion/react';
 import { X, Lock, Mail, User, Sparkles, ArrowRight, Eye, EyeOff, CheckCircle2 } from 'lucide-react';
 import { signInWithPopup, signInWithEmailAndPassword, createUserWithEmailAndPassword, sendPasswordResetEmail } from 'firebase/auth';
-import { doc, setDoc } from 'firebase/firestore';
-import { auth, db, googleProvider, handleFirestoreError, OperationType } from '../../lib/firebase';
+import { auth, googleProvider, syncUserToCloudDirectory } from '../../lib/firebase';
 import { api } from '../../lib/api';
 import { User as UserType } from '../../types';
 
@@ -42,38 +41,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
   if (!isOpen) return null;
 
   const syncUserToFirestore = async (user: UserType) => {
-    const uid = auth.currentUser?.uid;
-    if (!uid) return;
-    try {
-      await setDoc(
-        doc(db, 'users', uid),
-        {
-          uid,
-          username: user.username,
-          displayName: user.displayName,
-          avatarUrl: user.avatarUrl || '',
-          bio: user.bio || '',
-          onlineStatus: 'online',
-          createdAt: user.createdAt || new Date().toISOString(),
-        },
-        { merge: true }
-      );
-      await setDoc(
-        doc(db, 'users', uid, 'private', 'info'),
-        {
-          uid,
-          email: user.email,
-          updatedAt: new Date().toISOString(),
-        },
-        { merge: true }
-      );
-    } catch (err) {
-      try {
-        handleFirestoreError(err, OperationType.WRITE, `users/${uid}`);
-      } catch {
-        // Non-blocking
-      }
-    }
+    await syncUserToCloudDirectory(user);
   };
 
   const handleEmailPasswordSubmit = async (e: React.FormEvent) => {

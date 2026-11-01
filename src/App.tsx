@@ -75,6 +75,23 @@ export default function App() {
 
   const sendReadReceiptRef = useRef<(conversationId: string) => void>(() => {});
 
+  const dedupeMessages = useCallback((list: Message[]): Message[] => {
+    const map = new Map<string, Message>();
+    for (const item of list) {
+      if (!item || !item.id) continue;
+      const prev = map.get(item.id);
+      map.set(item.id, prev ? { ...prev, ...item } : item);
+    }
+    return Array.from(map.values());
+  }, []);
+
+  const handleUpdateMessages = useCallback(
+    (nextMessages: Message[]) => {
+      setMessages(dedupeMessages(nextMessages));
+    },
+    [dedupeMessages]
+  );
+
   // Add toast helper
   const addToast = useCallback((toast: Omit<ToastMessage, 'id'>) => {
     const id = Math.random().toString(36).substring(2, 9);
@@ -88,9 +105,9 @@ export default function App() {
   // WebSocket Event Handlers
   const socketHandlers = {
     onNewMessage: (msg: Message) => {
-      // If message is for active conversation, append
+      // If message is for active conversation, append with deduplication
       if (activeConversationIdRef.current === msg.conversationId) {
-        setMessages(prev => (prev.some(m => m.id === msg.id) ? prev : [...prev, msg]));
+        setMessages(prev => dedupeMessages([...prev, msg]));
         // If recipient has active conversation open, immediately mark as read & send receipt
         if (msg.senderId !== currentUserRef.current?.id) {
           api.markAsRead(msg.conversationId);
@@ -150,7 +167,7 @@ export default function App() {
     },
 
     onUpdateMessage: (msg: Message) => {
-      setMessages(prev => prev.map(m => (m.id === msg.id ? msg : m)));
+      setMessages(prev => dedupeMessages(prev.map(m => (m.id === msg.id ? msg : m))));
     },
 
     onDeleteMessage: ({ messageId }: { messageId: string }) => {
@@ -340,7 +357,7 @@ export default function App() {
     const fetchMsgs = async () => {
       try {
         const msgs = await api.getMessages(activeConversationId);
-        setMessages(msgs);
+        setMessages(dedupeMessages(msgs));
         await api.markAsRead(activeConversationId);
         sendReadReceipt(activeConversationId);
 
@@ -353,7 +370,7 @@ export default function App() {
     };
 
     fetchMsgs();
-  }, [activeConversationId, sendReadReceipt]);
+  }, [activeConversationId, sendReadReceipt, dedupeMessages]);
 
   // Actions
   const handleSendMessage = async (data: any) => {
@@ -363,7 +380,7 @@ export default function App() {
         conversationId: activeConversationId,
         ...data,
       });
-      setMessages(prev => [...prev, newMsg]);
+      setMessages(prev => dedupeMessages([...prev, newMsg]));
 
       setConversations(prev =>
         prev.map(c => (c.id === activeConversationId ? { ...c, lastMessage: newMsg } : c))
@@ -555,7 +572,7 @@ export default function App() {
         type: 'text',
       });
       if (activeConversationId === directConv.id) {
-        setMessages(prev => [...prev, newMsg]);
+        setMessages(prev => dedupeMessages([...prev, newMsg]));
       }
       setConversations(prev =>
         prev.map(c => (c.id === directConv!.id ? { ...c, lastMessage: newMsg } : c))
@@ -837,7 +854,7 @@ export default function App() {
                   onImageClick={setViewingImageUrl}
                   onOpenSettings={() => setActiveMainTab('settings')}
                   onBackMobile={() => setActiveConversationId(null)}
-                  onUpdateMessages={setMessages}
+                  onUpdateMessages={handleUpdateMessages}
                   onSelectConversation={id => setActiveConversationId(id)}
                   onMarkAsRead={handleMarkAsRead}
                 />

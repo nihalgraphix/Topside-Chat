@@ -560,8 +560,8 @@ router.get('/users/search', authenticate, (req: AuthRequest, res) => {
 
 router.post('/users/create-contact', authenticate, async (req: AuthRequest, res) => {
   try {
-    const { email, username } = req.body;
-    const identifier = (email || username || '').trim().toLowerCase().replace(/^@/, '');
+    const { name, email, username, phone, bio } = req.body;
+    const identifier = (email || username || name || '').trim().toLowerCase().replace(/^@/, '');
     if (!identifier) {
       return res.status(400).json({ error: 'Email or @username is required to add a contact' });
     }
@@ -572,9 +572,46 @@ router.post('/users/create-contact', authenticate, async (req: AuthRequest, res)
       return res.json({ user });
     }
 
-    return res.status(404).json({
-      error: 'User not found. Only registered and signed-in persons can be added to contacts.',
-    });
+    // Auto-provision the contact so users can immediately start chatting
+    const isEmail = identifier.includes('@');
+    const targetEmail = isEmail ? identifier : `${identifier.replace(/[^a-z0-9_]/g, '_')}@aether.local`;
+    let baseUsername = (isEmail ? identifier.split('@')[0] : identifier)
+      .replace(/[^a-z0-9_]/g, '_')
+      .slice(0, 24);
+    if (baseUsername.length < 3) baseUsername = `user_${baseUsername || 'contact'}`;
+
+    let finalUsername = baseUsername;
+    let counter = 1;
+    while (db.getUserByUsername(finalUsername)) {
+      finalUsername = `${baseUsername}_${counter++}`;
+    }
+
+    const displayName =
+      (name || '').trim() ||
+      (isEmail ? identifier.split('@')[0] : identifier)
+        .replace(/[._-]+/g, ' ')
+        .replace(/\b\w/g, (l: string) => l.toUpperCase());
+
+    const salt = bcrypt.genSaltSync(10);
+    const passwordHash = bcrypt.hashSync(`contact_${Date.now()}`, salt);
+
+    const newUser: User = {
+      id: `u_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
+      username: finalUsername,
+      displayName,
+      email: targetEmail,
+      phone: phone?.trim(),
+      avatarUrl: `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(displayName)}`,
+      bio: bio?.trim() || 'Member of the encrypted communications mesh.',
+      onlineStatus: 'online',
+      isOnline: true,
+      lastSeen: new Date().toISOString(),
+      createdAt: new Date().toISOString(),
+      role: 'user',
+    };
+
+    const created = db.createUser({ ...newUser, passwordHash });
+    return res.json({ user: created });
   } catch (err: any) {
     res.status(500).json({ error: err.message || 'Failed to find contact' });
   }

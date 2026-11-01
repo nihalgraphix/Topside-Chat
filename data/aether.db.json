@@ -1,6 +1,33 @@
 {
-  "users": [],
-  "sessions": [],
+  "users": [
+    {
+      "id": "u_g_1789118321867_ri6j",
+      "username": "nihal_graphix",
+      "displayName": "Nihal Graphix",
+      "email": "nihal.graphix@gmail.com",
+      "avatarUrl": "https://api.dicebear.com/7.x/initials/svg?seed=Nihal%20Graphix",
+      "bio": "Member of the encrypted communications mesh.",
+      "onlineStatus": "online",
+      "isOnline": true,
+      "lastSeen": "2026-11-01T13:54:44.911Z",
+      "createdAt": "2026-11-01T13:53:34.362Z",
+      "role": "user",
+      "passwordHash": "$2b$10$ZNS.GhcTHJEZC0RCnDf/de3Cd7Cq.7vdXg1VLlNwxkOHU2iF4U.Q."
+    }
+  ],
+  "sessions": [
+    {
+      "id": "sess_1793541284912",
+      "userId": "u_g_1789118321867_ri6j",
+      "deviceName": "Desktop Browser",
+      "browser": "Web Client",
+      "os": "Standard OS",
+      "ip": "127.0.0.1",
+      "lastActive": "2026-11-01T13:54:44.913Z",
+      "isCurrent": true,
+      "createdAt": "2026-11-01T13:54:44.913Z"
+    }
+  ],
   "conversations": [],
   "conversationMembers": [],
   "messages": [],
@@ -9,5 +36,32 @@
   "folders": [],
   "reports": [],
   "blockedUsers": [],
-  "userSettings": {}
+  "userSettings": {
+    "u_g_1789118321867_ri6j": {
+      "theme": "dark",
+      "accent": "aurora",
+      "fontSize": "md",
+      "glassIntensity": "high",
+      "notifications": {
+        "messages": true,
+        "calls": true,
+        "mentionsOnly": false,
+        "preview": true,
+        "sound": true
+      },
+      "privacy": {
+        "lastSeen": "everyone",
+        "readReceipts": true,
+        "profilePhoto": "everyone",
+        "stories": "everyone",
+        "disappearingDefault": 0
+      },
+      "mediaAutoDownload": {
+        "photos": true,
+        "videos": false,
+        "documents": true,
+        "audio": true
+      }
+    }
+  }
 }

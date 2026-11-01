@@ -72,55 +72,57 @@ export const SignUpPage: React.FC<SignUpPageProps> = ({ onSuccess }) => {
 
     try {
       if (authMode === 'login') {
-        if (!email.trim() || !password) {
+        const cleanId = email.trim();
+        if (!cleanId || !password) {
           throw new Error('Please enter your email/username and password.');
         }
-        if (email.includes('@')) {
+
+        const res = await api.login(cleanId, password);
+
+        // Non-blocking background sync with Firebase
+        void (async () => {
           try {
-            await signInWithEmailAndPassword(auth, email.trim(), password);
+            if (cleanId.includes('@')) {
+              await signInWithEmailAndPassword(auth, cleanId, password).catch(() => {});
+            }
+            await syncUserToFirestore(res.user);
           } catch {
-            // Continue to backend JWT verification
+            // Ignore background Firebase sync errors
           }
-        }
-        const res = await api.login(email.trim(), password);
-        await syncUserToFirestore(res.user);
+        })();
+
         setSuccessMsg(`Welcome back, ${res.user.displayName}!`);
-        setTimeout(() => {
-          onSuccess(res.user);
-        }, 350);
+        onSuccess(res.user);
       } else if (authMode === 'register') {
-        if (!email.trim() || !password) {
+        const cleanEmail = email.trim().toLowerCase();
+        if (!cleanEmail || !password) {
           throw new Error('Please enter your email address and password.');
         }
-        if (password.length < 6) {
-          throw new Error('Password must be at least 6 characters.');
-        }
-        const cleanEmail = email.trim().toLowerCase();
-        try {
-          await createUserWithEmailAndPassword(auth, cleanEmail, password);
-        } catch {
-          // Continue to backend registration
-        }
+
         const res = await api.register({
           firstName: firstName.trim() || cleanEmail.split('@')[0],
           lastName: lastName.trim(),
           email: cleanEmail,
           password,
         });
-        await syncUserToFirestore(res.user);
+
+        // Non-blocking background sync with Firebase
+        void (async () => {
+          try {
+            await createUserWithEmailAndPassword(auth, cleanEmail, password).catch(() => {});
+            await syncUserToFirestore(res.user);
+          } catch {
+            // Ignore background Firebase sync errors
+          }
+        })();
+
         setSuccessMsg(`Account created! Welcome, ${res.user.displayName}.`);
-        setTimeout(() => {
-          onSuccess(res.user);
-        }, 400);
+        onSuccess(res.user);
       } else if (authMode === 'forgot') {
         if (!email.trim()) {
           throw new Error('Please enter your registered email address.');
         }
-        try {
-          await sendPasswordResetEmail(auth, email.trim());
-        } catch {
-          // Fallback to backend recovery dispatch
-        }
+        void sendPasswordResetEmail(auth, email.trim()).catch(() => {});
         const res = await api.forgotPassword(email.trim());
         setSuccessMsg(res.message || `Password recovery link sent to ${email.trim()}.`);
       }
@@ -131,51 +133,83 @@ export const SignUpPage: React.FC<SignUpPageProps> = ({ onSuccess }) => {
     }
   };
 
-  const handleFirebaseGooglePopup = async () => {
-    setError(null);
-    setSuccessMsg(null);
-    setIsLoading(true);
-    try {
-      const cred = await signInWithPopup(auth, googleProvider);
-      const gUser = cred.user;
-      const gEmail = gUser.email || googleEmail;
-      const gName = gUser.displayName || gEmail.split('@')[0];
-      const res = await api.googleLogin({
-        email: gEmail.toLowerCase(),
-        displayName: gName,
-        avatarUrl: gUser.photoURL || undefined,
-      });
-      await syncUserToFirestore(res.user);
-      setSuccessMsg(`Signed in with Google as ${res.user.email}`);
-      setTimeout(() => {
-        onSuccess(res.user);
-      }, 350);
-    } catch {
-      // In restricted preview iframes where browser blocks third-party popups, open the Google account selector modal
-      setIsLoading(false);
-      setShowGoogleModal(true);
+  const signInWithGoogleAccount = async (targetEmail: string, targetName?: string, avatarUrl?: string) => {
+    const cleanEmail = targetEmail.trim().toLowerCase();
+    if (!cleanEmail) {
+      setError('Please enter your Google email address.');
+      return;
     }
-  };
-
-  const handleGoogleAccountConfirm = async () => {
     setError(null);
     setIsLoading(true);
     try {
+      const resolvedName =
+        (targetName || '').trim() ||
+        cleanEmail
+          .split('@')[0]
+          .replace(/[._-]+/g, ' ')
+          .replace(/\b\w/g, l => l.toUpperCase());
       const res = await api.googleLogin({
-        email: googleEmail.trim().toLowerCase(),
-        displayName: googleName.trim() || googleEmail.split('@')[0],
+        email: cleanEmail,
+        displayName: resolvedName,
+        avatarUrl,
       });
-      await syncUserToFirestore(res.user);
+      void syncUserToFirestore(res.user);
       setShowGoogleModal(false);
       setSuccessMsg(`Signed in with Google as ${res.user.email}`);
-      setTimeout(() => {
-        onSuccess(res.user);
-      }, 350);
+      onSuccess(res.user);
     } catch (err: any) {
       setError(err.message || 'Google authentication failed');
     } finally {
       setIsLoading(false);
     }
+  };
+
+  const handleFirebaseGooglePopup = async () => {
+    setError(null);
+    setSuccessMsg(null);
+
+    const candidateEmail =
+      googleEmail.trim() || (email.includes('@') ? email.trim() : '');
+
+    if (auth.currentUser?.email) {
+      await signInWithGoogleAccount(
+        auth.currentUser.email,
+        auth.currentUser.displayName || googleName,
+        auth.currentUser.photoURL || undefined
+      );
+      return;
+    }
+
+    setIsLoading(true);
+    try {
+      const cred = await signInWithPopup(auth, googleProvider);
+      const gUser = cred.user;
+      const gEmail = gUser.email || candidateEmail;
+      if (gEmail) {
+        await signInWithGoogleAccount(
+          gEmail,
+          gUser.displayName || googleName,
+          gUser.photoURL || undefined
+        );
+        return;
+      }
+    } catch {
+      // In restricted preview iframes where browser blocks third-party popups, fall back to direct Google email sign-in
+    }
+
+    setIsLoading(false);
+    if (candidateEmail) {
+      await signInWithGoogleAccount(
+        candidateEmail,
+        googleName || [firstName, lastName].filter(Boolean).join(' ')
+      );
+    } else {
+      setShowGoogleModal(true);
+    }
+  };
+
+  const handleGoogleAccountConfirm = async () => {
+    await signInWithGoogleAccount(googleEmail, googleName);
   };
 
   return (
@@ -565,18 +599,31 @@ export const SignUpPage: React.FC<SignUpPageProps> = ({ onSuccess }) => {
                   <label className="text-xs text-neutral-300 font-medium block mb-1">Google Email</label>
                   <input
                     type="email"
+                    autoFocus
                     value={googleEmail}
                     onChange={e => setGoogleEmail(e.target.value)}
+                    onKeyDown={e => {
+                      if (e.key === 'Enter' && googleEmail.trim()) {
+                        e.preventDefault();
+                        handleGoogleAccountConfirm();
+                      }
+                    }}
                     placeholder="yourname@gmail.com"
                     className="w-full px-3.5 py-2.5 rounded-xl bg-[#141414] border border-white/15 text-white text-xs focus:outline-none focus:border-white"
                   />
                 </div>
                 <div>
-                  <label className="text-xs text-neutral-300 font-medium block mb-1">Display Name</label>
+                  <label className="text-xs text-neutral-300 font-medium block mb-1">Display Name (optional)</label>
                   <input
                     type="text"
                     value={googleName}
                     onChange={e => setGoogleName(e.target.value)}
+                    onKeyDown={e => {
+                      if (e.key === 'Enter' && googleEmail.trim()) {
+                        e.preventDefault();
+                        handleGoogleAccountConfirm();
+                      }
+                    }}
                     placeholder="Your Full Name"
                     className="w-full px-3.5 py-2.5 rounded-xl bg-[#141414] border border-white/15 text-white text-xs focus:outline-none focus:border-white"
                   />

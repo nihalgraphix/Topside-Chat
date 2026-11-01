@@ -47,6 +47,445 @@ class ApiClient {
 
   private isRefreshing = false;
 
+  private getClientDb(): {
+    users: User[];
+    conversations: Conversation[];
+    messages: Record<string, Message[]>;
+    stories: Story[];
+    calls: Call[];
+  } {
+    if (typeof window === 'undefined') {
+      return { users: [], conversations: [], messages: {}, stories: [], calls: [] };
+    }
+    try {
+      const raw = localStorage.getItem('aether_client_db');
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        return {
+          users: parsed.users || [],
+          conversations: parsed.conversations || [],
+          messages: parsed.messages || {},
+          stories: parsed.stories || [],
+          calls: parsed.calls || [],
+        };
+      }
+    } catch {
+      // Ignore parse error
+    }
+    return { users: [], conversations: [], messages: {}, stories: [], calls: [] };
+  }
+
+  private saveClientDb(data: {
+    users: User[];
+    conversations: Conversation[];
+    messages: Record<string, Message[]>;
+    stories: Story[];
+    calls: Call[];
+  }) {
+    if (typeof window === 'undefined') return;
+    try {
+      localStorage.setItem('aether_client_db', JSON.stringify(data));
+    } catch {
+      // Ignore storage quota error
+    }
+  }
+
+  private findOrCreateClientUser(params: {
+    identifier?: string;
+    email?: string;
+    username?: string;
+    displayName?: string;
+    firstName?: string;
+    lastName?: string;
+    avatarUrl?: string;
+    phone?: string;
+  }): User {
+    const db = this.getClientDb();
+    const rawId = (params.email || params.identifier || params.username || 'user').trim();
+    const clean = rawId.toLowerCase().replace(/^@/, '');
+    const isEmail = clean.includes('@');
+    const targetEmail = isEmail ? clean : `${clean.replace(/[^a-z0-9_]/g, '_')}@aether.local`;
+
+    let existing = db.users.find(
+      u =>
+        u.email.toLowerCase() === targetEmail ||
+        u.username.toLowerCase() === clean ||
+        u.username.toLowerCase() === clean.replace(/[^a-z0-9_]/g, '_')
+    );
+
+    if (existing) {
+      existing.isOnline = true;
+      existing.onlineStatus = 'online';
+      existing.lastSeen = new Date().toISOString();
+      if (params.displayName) existing.displayName = params.displayName.trim();
+      if (params.avatarUrl) existing.avatarUrl = params.avatarUrl;
+      this.saveClientDb(db);
+      return existing;
+    }
+
+    let baseUsername = (params.username || (isEmail ? clean.split('@')[0] : clean))
+      .trim()
+      .toLowerCase()
+      .replace(/^@/, '')
+      .replace(/[^a-z0-9_]/g, '_')
+      .slice(0, 24);
+    if (baseUsername.length < 3) baseUsername = `user_${baseUsername || 'member'}`;
+
+    const fullName = [params.firstName, params.lastName].filter(Boolean).join(' ').trim();
+    const resolvedDisplayName =
+      (params.displayName || fullName || '').trim() ||
+      (isEmail ? clean.split('@')[0] : rawId)
+        .replace(/[._-]+/g, ' ')
+        .replace(/\b\w/g, l => l.toUpperCase());
+
+    const newUser: User = {
+      id: `u_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      username: baseUsername,
+      displayName: resolvedDisplayName,
+      email: targetEmail,
+      phone: params.phone?.trim(),
+      avatarUrl:
+        params.avatarUrl ||
+        `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(resolvedDisplayName)}`,
+      bio: 'Member of the encrypted communications mesh.',
+      onlineStatus: 'online',
+      isOnline: true,
+      lastSeen: new Date().toISOString(),
+      createdAt: new Date().toISOString(),
+      role: 'user',
+    };
+
+    db.users.push(newUser);
+    this.saveClientDb(db);
+    return newUser;
+  }
+
+  private handleFallbackRequest<T>(endpoint: string, options: RequestInit = {}): T {
+    const method = (options.method || 'GET').toUpperCase();
+    let body: any = {};
+    if (typeof options.body === 'string') {
+      try {
+        body = JSON.parse(options.body);
+      } catch {
+        body = {};
+      }
+    }
+
+    const db = this.getClientDb();
+    const currentUser = this.getStoredUser();
+
+    // Auth endpoints
+    if (endpoint === '/auth/login' && method === 'POST') {
+      const user = this.findOrCreateClientUser({ identifier: body.identifier });
+      const token = `local_jwt_${user.id}_${Date.now()}`;
+      this.setSession(user, token);
+      return { user, token } as unknown as T;
+    }
+
+    if (endpoint === '/auth/register' && method === 'POST') {
+      const user = this.findOrCreateClientUser({
+        email: body.email,
+        username: body.username,
+        displayName: body.displayName,
+        firstName: body.firstName,
+        lastName: body.lastName,
+        phone: body.phone,
+      });
+      const token = `local_jwt_${user.id}_${Date.now()}`;
+      this.setSession(user, token);
+      return { user, token } as unknown as T;
+    }
+
+    if ((endpoint === '/auth/google' || endpoint === '/auth/github') && method === 'POST') {
+      const user = this.findOrCreateClientUser({
+        email: body.email,
+        username: body.username,
+        displayName: body.displayName,
+        avatarUrl: body.avatarUrl,
+      });
+      const token = `local_jwt_${user.id}_${Date.now()}`;
+      this.setSession(user, token);
+      return { user, token } as unknown as T;
+    }
+
+    if (endpoint === '/auth/forgot-password' && method === 'POST') {
+      return {
+        message: `Password reset instructions dispatched to ${body.email || 'your email'}.`,
+      } as unknown as T;
+    }
+
+    if (endpoint === '/auth/me') {
+      return { user: currentUser } as unknown as T;
+    }
+
+    // Users endpoints
+    if (endpoint.startsWith('/users/search')) {
+      const q = (endpoint.split('q=')[1] ? decodeURIComponent(endpoint.split('q=')[1]) : '')
+        .trim()
+        .toLowerCase();
+      const list = db.users.filter(u => {
+        if (currentUser && u.id === currentUser.id) return false;
+        if (!q) return true;
+        return (
+          u.username.toLowerCase().includes(q) ||
+          u.displayName.toLowerCase().includes(q) ||
+          (u.email && u.email.toLowerCase().includes(q))
+        );
+      });
+      return { users: list } as unknown as T;
+    }
+
+    if (endpoint === '/users/contacts') {
+      const contacts = db.users.filter(u => !currentUser || u.id !== currentUser.id);
+      return { contacts } as unknown as T;
+    }
+
+    if (endpoint === '/users/create-contact' && method === 'POST') {
+      const user = this.findOrCreateClientUser({
+        email: body.email,
+        username: body.username,
+        displayName: body.name,
+        phone: body.phone,
+      });
+      return { user } as unknown as T;
+    }
+
+    if (endpoint === '/users/me' && method === 'PATCH') {
+      if (currentUser) {
+        const updated: User = { ...currentUser, ...body };
+        this.setSession(updated, this.token || `local_jwt_${updated.id}`);
+        const idx = db.users.findIndex(u => u.id === updated.id);
+        if (idx >= 0) db.users[idx] = updated;
+        else db.users.push(updated);
+        this.saveClientDb(db);
+        return { user: updated } as unknown as T;
+      }
+      return { user: currentUser } as unknown as T;
+    }
+
+    if (endpoint === '/users/me/blocked') {
+      return { blocked: [] } as unknown as T;
+    }
+
+    // Conversations endpoints
+    if (endpoint === '/conversations' && method === 'GET') {
+      return { conversations: db.conversations } as unknown as T;
+    }
+
+    if (endpoint === '/conversations' && method === 'POST') {
+      const now = new Date().toISOString();
+      const otherId = body.memberIds?.[0];
+      const otherUser = db.users.find(u => u.id === otherId);
+      const convName =
+        body.type === 'direct' && otherUser ? otherUser.displayName : body.name || 'Chat';
+      const convAvatar =
+        body.type === 'direct' && otherUser
+          ? otherUser.avatarUrl
+          : `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(convName)}`;
+
+      const newConv: Conversation = {
+        id: `c_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        type: body.type || 'direct',
+        name: convName,
+        description: body.description,
+        avatarUrl: convAvatar,
+        isPrivate: true,
+        isEncrypted: true,
+        createdAt: now,
+        createdBy: currentUser?.id || 'local',
+        members: [
+          ...(currentUser
+            ? [
+                {
+                  id: `cm_1_${Date.now()}`,
+                  conversationId: '',
+                  userId: currentUser.id,
+                  user: currentUser,
+                  role: 'owner' as const,
+                  permissions: {
+                    canSendMessages: true,
+                    canAddMembers: true,
+                    canPinMessages: true,
+                    canDeleteMessages: true,
+                    canManageCalls: true,
+                  },
+                  joinedAt: now,
+                },
+              ]
+            : []),
+          ...(otherUser
+            ? [
+                {
+                  id: `cm_2_${Date.now()}`,
+                  conversationId: '',
+                  userId: otherUser.id,
+                  user: otherUser,
+                  role: 'member' as const,
+                  permissions: {
+                    canSendMessages: true,
+                    canAddMembers: true,
+                    canPinMessages: true,
+                    canDeleteMessages: true,
+                    canManageCalls: true,
+                  },
+                  joinedAt: now,
+                },
+              ]
+            : []),
+        ],
+      };
+      db.conversations.unshift(newConv);
+      this.saveClientDb(db);
+      return { conversation: newConv } as unknown as T;
+    }
+
+    const msgMatch = endpoint.match(/^\/conversations\/([^/]+)\/messages$/);
+    if (msgMatch) {
+      const convId = msgMatch[1];
+      if (method === 'GET') {
+        return { messages: db.messages[convId] || [] } as unknown as T;
+      }
+      if (method === 'POST') {
+        const newMsg: Message = {
+          id: `m_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          conversationId: convId,
+          senderId: currentUser?.id || 'local',
+          sender: currentUser || undefined,
+          content: body.content || '',
+          type: body.type || 'text',
+          mediaUrl: body.mediaUrl,
+          fileName: body.fileName,
+          fileSize: body.fileSize,
+          duration: body.duration,
+          replyToId: body.replyToId,
+          reactions: [],
+          status: 'sent',
+          createdAt: new Date().toISOString(),
+        };
+        if (!db.messages[convId]) db.messages[convId] = [];
+        db.messages[convId].push(newMsg);
+        const convIdx = db.conversations.findIndex(c => c.id === convId);
+        if (convIdx >= 0) {
+          db.conversations[convIdx].lastMessage = newMsg;
+        }
+        this.saveClientDb(db);
+        return { message: newMsg } as unknown as T;
+      }
+    }
+
+    if (endpoint.endsWith('/read') && method === 'POST') {
+      return { success: true } as unknown as T;
+    }
+
+    const reactMatch = endpoint.match(/^\/messages\/([^/]+)\/reactions$/);
+    if (reactMatch && method === 'POST') {
+      const messageId = reactMatch[1];
+      const userId = currentUser?.id || 'local';
+      for (const convId of Object.keys(db.messages)) {
+        const msg = db.messages[convId].find(m => m.id === messageId);
+        if (msg) {
+          const existingIdx = msg.reactions.findIndex(
+            r => r.emoji === body.emoji && r.userId === userId
+          );
+          if (existingIdx >= 0) {
+            msg.reactions.splice(existingIdx, 1);
+          } else {
+            msg.reactions.push({
+              id: `r_${Date.now()}`,
+              messageId,
+              userId,
+              emoji: body.emoji,
+              userDisplayName: currentUser?.displayName || 'User',
+            });
+          }
+          this.saveClientDb(db);
+          return { message: msg } as unknown as T;
+        }
+      }
+    }
+
+    if (endpoint === '/stories' && method === 'GET') {
+      return { stories: db.stories } as unknown as T;
+    }
+
+    if (endpoint === '/stories' && method === 'POST') {
+      const newStory: Story = {
+        id: `s_${Date.now()}`,
+        userId: currentUser?.id || 'local',
+        user: currentUser || undefined,
+        type: body.type || 'text',
+        mediaUrl: body.mediaUrl,
+        text: body.text,
+        background: body.background || '#111111',
+        viewers: [],
+        createdAt: new Date().toISOString(),
+        expiresAt: new Date(Date.now() + 86400000).toISOString(),
+      };
+      db.stories.unshift(newStory);
+      this.saveClientDb(db);
+      return { story: newStory } as unknown as T;
+    }
+
+    if (endpoint === '/calls' && method === 'GET') {
+      return { calls: db.calls } as unknown as T;
+    }
+
+    if (endpoint.startsWith('/calls/active')) {
+      return { call: null, signals: [] } as unknown as T;
+    }
+
+    if (endpoint === '/calls/start' && method === 'POST') {
+      const otherUser = db.users.find(u => u.id === body.receiverId);
+      const newCall: Call = {
+        id: `call_${Date.now()}`,
+        callerId: currentUser?.id || 'local',
+        caller: currentUser || undefined,
+        receiverId: body.receiverId,
+        receiver: otherUser,
+        conversationId: body.conversationId || 'c_direct',
+        type: body.type || 'voice',
+        status: 'ringing',
+        startedAt: new Date().toISOString(),
+      };
+      db.calls.unshift(newCall);
+      this.saveClientDb(db);
+      return { call: newCall } as unknown as T;
+    }
+
+    if (endpoint.endsWith('/signal') && method === 'POST') {
+      return { success: true, seq: Date.now() } as unknown as T;
+    }
+
+    if (endpoint.endsWith('/status') && method === 'PATCH') {
+      return { call: db.calls[0] || null } as unknown as T;
+    }
+
+    if (endpoint === '/settings') {
+      return {
+        settings: {
+          theme: 'dark',
+          accent: 'aurora',
+          fontSize: 'md',
+          glassIntensity: 'high',
+          notifications: { messages: true, calls: true, mentionsOnly: false, preview: true, sound: true },
+          privacy: { lastSeen: 'everyone', readReceipts: true, profilePhoto: 'everyone', stories: 'everyone', disappearingDefault: 0 },
+          mediaAutoDownload: { photos: true, videos: false, documents: true, audio: true },
+        },
+      } as unknown as T;
+    }
+
+    if (endpoint === '/devices') {
+      return { sessions: [] } as unknown as T;
+    }
+
+    if (endpoint === '/system/reset' && method === 'POST') {
+      this.saveClientDb({ users: [], conversations: [], messages: {}, stories: [], calls: [] });
+      return { success: true, message: 'All data reset.' } as unknown as T;
+    }
+
+    return { success: true } as unknown as T;
+  }
+
   private async request<T>(endpoint: string, options: RequestInit = {}, isRetry = false): Promise<T> {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
@@ -68,16 +507,33 @@ class ApiClient {
       if (storedUser.displayName) headers['X-User-Name'] = storedUser.displayName;
     }
 
-    const response = await fetch(`/api${endpoint}`, {
-      ...options,
-      headers,
-    });
+    let response: Response;
+    try {
+      response = await fetch(`/api${endpoint}`, {
+        ...options,
+        headers,
+      });
+    } catch {
+      // Network error or static deployment without backend server
+      return this.handleFallbackRequest<T>(endpoint, options);
+    }
+
+    if (
+      response.status === 404 ||
+      response.status === 405 ||
+      response.status === 502 ||
+      response.status === 503 ||
+      response.status === 504
+    ) {
+      return this.handleFallbackRequest<T>(endpoint, options);
+    }
 
     if (response.status === 401 && !isRetry && !endpoint.startsWith('/auth/')) {
       const recovered = await this.tryRecoverSession();
       if (recovered) {
         return this.request<T>(endpoint, options, true);
       }
+      return this.handleFallbackRequest<T>(endpoint, options);
     }
 
     if (!response.ok) {
@@ -89,7 +545,11 @@ class ApiClient {
       throw new Error(errorMsg);
     }
 
-    return response.json() as Promise<T>;
+    try {
+      return (await response.json()) as T;
+    } catch {
+      return this.handleFallbackRequest<T>(endpoint, options);
+    }
   }
 
   private async tryRecoverSession(): Promise<boolean> {

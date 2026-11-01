@@ -540,9 +540,28 @@ router.post('/auth/forgot-password', (req, res) => {
 
 // --- USERS ROUTES ---
 
-router.get('/users/search', authenticate, (req: AuthRequest, res) => {
+const filterOutSelf = (users: User[], self: User): User[] => {
+  const selfEmail = (self.email || '').trim().toLowerCase();
+  const selfUsername = (self.username || '').trim().toLowerCase();
+  return users.filter(u => {
+    if (u.id === self.id) return false;
+    if (selfEmail && u.email && u.email.trim().toLowerCase() === selfEmail) return false;
+    if (selfUsername && u.username && u.username.trim().toLowerCase() === selfUsername) return false;
+    return true;
+  });
+};
+
+router.get('/users/search', authenticate, async (req: AuthRequest, res) => {
+  try {
+    await Promise.race([
+      db.pullUsersFromCloud(),
+      new Promise(resolve => setTimeout(resolve, 1500)),
+    ]);
+  } catch {
+    // Ignore timeout
+  }
   const query = ((req.query.q as string) || '').trim().toLowerCase().replace(/^@/, '');
-  const allUsers = db.getUsers().filter(u => u.id !== req.user!.id);
+  const allUsers = filterOutSelf(db.getUsers(), req.user!);
   if (!query) {
     return res.json({ users: allUsers });
   }
@@ -556,6 +575,19 @@ router.get('/users/search', authenticate, (req: AuthRequest, res) => {
   );
 
   res.json({ users: matched });
+});
+
+router.post('/users/sync', authenticate, async (req: AuthRequest, res) => {
+  try {
+    const incoming = Array.isArray(req.body?.users) ? req.body.users : [];
+    if (incoming.length > 0) {
+      db.upsertExternalUsers(incoming);
+    }
+    const allUsers = filterOutSelf(db.getUsers(), req.user!);
+    res.json({ users: allUsers });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to sync users' });
+  }
 });
 
 router.post('/users/create-contact', authenticate, async (req: AuthRequest, res) => {
@@ -617,8 +649,16 @@ router.post('/users/create-contact', authenticate, async (req: AuthRequest, res)
   }
 });
 
-router.get('/users/contacts', authenticate, (req: AuthRequest, res) => {
-  const allUsers = db.getUsers().filter(u => u.id !== req.user!.id);
+router.get('/users/contacts', authenticate, async (req: AuthRequest, res) => {
+  try {
+    await Promise.race([
+      db.pullUsersFromCloud(),
+      new Promise(resolve => setTimeout(resolve, 1500)),
+    ]);
+  } catch {
+    // Ignore timeout
+  }
+  const allUsers = filterOutSelf(db.getUsers(), req.user!);
   res.json({ contacts: allUsers });
 });
 
@@ -675,7 +715,11 @@ router.get('/conversations', authenticate, (req: AuthRequest, res) => {
 });
 
 router.post('/conversations', authenticate, (req: AuthRequest, res) => {
-  const { type, name, description, avatarUrl, username, isPrivate, memberIds } = req.body;
+  const { type, name, description, avatarUrl, username, isPrivate, memberIds, memberUsers } = req.body;
+
+  if (Array.isArray(memberUsers) && memberUsers.length > 0) {
+    db.upsertExternalUsers(memberUsers, false);
+  }
 
   if (type === 'direct' && memberIds && memberIds.length > 0) {
     // Check if direct conversation already exists with this user

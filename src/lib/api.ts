@@ -1,4 +1,7 @@
 import { User, Conversation, Message, Story, Call, UserSettings, DeviceSession, ChatFolder, AdminStats, Report, BlockedUser } from '../types';
+import { syncUserToCloudDirectory, fetchCloudDirectoryUsers } from './firebase';
+
+const REMOTE_API_ORIGIN = 'https://ais-pre-jpz57iqlur4hyo5s2f2gkp-455372508405.asia-southeast1.run.app';
 
 class ApiClient {
   private token: string | null = null;
@@ -21,6 +24,8 @@ class ApiClient {
     if (token && user) {
       localStorage.setItem('aether_token', token);
       localStorage.setItem('aether_user', JSON.stringify(user));
+      this.upsertLocalUsers([user]);
+      void syncUserToCloudDirectory(user);
     } else {
       localStorage.removeItem('aether_token');
       localStorage.removeItem('aether_user');
@@ -486,6 +491,101 @@ class ApiClient {
     return { success: true } as unknown as T;
   }
 
+  private upsertLocalUsers(users: User[]) {
+    if (!users || users.length === 0) return;
+    const db = this.getClientDb();
+    let changed = false;
+    for (const u of users) {
+      if (!u || !u.id) continue;
+      const cleanUsername = (u.username || '').trim().toLowerCase();
+      const cleanEmail = (u.email || '').trim().toLowerCase();
+      const idx = db.users.findIndex(
+        existing =>
+          existing.id === u.id ||
+          (cleanUsername && existing.username.toLowerCase() === cleanUsername) ||
+          (cleanEmail && existing.email && existing.email.toLowerCase() === cleanEmail)
+      );
+      if (idx >= 0) {
+        db.users[idx] = { ...db.users[idx], ...u };
+        changed = true;
+      } else {
+        db.users.push(u);
+        changed = true;
+      }
+    }
+    if (changed) {
+      this.saveClientDb(db);
+    }
+  }
+
+  private mergeDirectoryUsers(lists: User[][], queryStr = ''): User[] {
+    const currentUser = this.getStoredUser();
+    const selfId = currentUser?.id;
+    const selfEmail = (currentUser?.email || '').trim().toLowerCase();
+    const selfUsername = (currentUser?.username || '').trim().toLowerCase();
+
+    const db = this.getClientDb();
+    const convUsers: User[] = [];
+    for (const c of db.conversations) {
+      for (const m of c.members || []) {
+        if (m.user) convUsers.push(m.user);
+      }
+    }
+
+    const combined = [...lists.flat(), ...db.users, ...convUsers];
+    const byKey = new Map<string, User>();
+
+    for (const u of combined) {
+      if (!u || (!u.id && !u.username)) continue;
+      const uEmail = (u.email || '').trim().toLowerCase();
+      const uUsername = (u.username || '').trim().toLowerCase();
+      if (
+        uUsername === 'directory_reader' ||
+        uUsername === 'guest_viewer' ||
+        u.id === 'u_1789118066028_c7hyx' ||
+        /john\s*fran/i.test(u.displayName || '')
+      ) {
+        continue;
+      }
+      if (selfId && u.id === selfId) continue;
+      if (selfEmail && uEmail && uEmail === selfEmail) continue;
+      if (selfUsername && uUsername && uUsername === selfUsername) continue;
+
+      const dedupeKey = uUsername || uEmail || u.id;
+      const existing = byKey.get(dedupeKey);
+      if (!existing) {
+        byKey.set(dedupeKey, u);
+      } else {
+        // Prefer real email over synthetic @aether.chat email
+        const betterEmail =
+          existing.email && !existing.email.endsWith('@aether.chat') && !existing.email.endsWith('@aether.local')
+            ? existing.email
+            : u.email || existing.email;
+        const betterId = existing.id.startsWith('u_') ? existing.id : u.id || existing.id;
+        byKey.set(dedupeKey, {
+          ...existing,
+          ...u,
+          id: betterId,
+          email: betterEmail,
+        });
+      }
+    }
+
+    const allMerged = Array.from(byKey.values());
+    this.upsertLocalUsers(allMerged);
+
+    const q = queryStr.trim().toLowerCase().replace(/^@/, '');
+    if (!q) return allMerged;
+
+    return allMerged.filter(
+      u =>
+        u.displayName.toLowerCase().includes(q) ||
+        u.username.toLowerCase().includes(q) ||
+        (u.email && u.email.toLowerCase().includes(q)) ||
+        (u.phone && u.phone.toLowerCase().includes(q))
+    );
+  }
+
   private async request<T>(endpoint: string, options: RequestInit = {}, isRetry = false): Promise<T> {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
@@ -514,8 +614,7 @@ class ApiClient {
         headers,
       });
     } catch {
-      // Network error or static deployment without backend server
-      return this.handleFallbackRequest<T>(endpoint, options);
+      return this.tryRemoteOrFallback<T>(endpoint, options, headers);
     }
 
     if (
@@ -525,7 +624,7 @@ class ApiClient {
       response.status === 503 ||
       response.status === 504
     ) {
-      return this.handleFallbackRequest<T>(endpoint, options);
+      return this.tryRemoteOrFallback<T>(endpoint, options, headers);
     }
 
     if (response.status === 401 && !isRetry && !endpoint.startsWith('/auth/')) {
@@ -550,6 +649,31 @@ class ApiClient {
     } catch {
       return this.handleFallbackRequest<T>(endpoint, options);
     }
+  }
+
+  private async tryRemoteOrFallback<T>(
+    endpoint: string,
+    options: RequestInit,
+    headers: Record<string, string>
+  ): Promise<T> {
+    if (typeof window !== 'undefined' && !window.location.origin.includes('ais-pre-jpz57iqlur4hyo5s2f2gkp')) {
+      try {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 3000);
+        const remoteRes = await fetch(`${REMOTE_API_ORIGIN}/api${endpoint}`, {
+          ...options,
+          headers,
+          signal: controller.signal,
+        });
+        clearTimeout(timer);
+        if (remoteRes.ok) {
+          return (await remoteRes.json()) as T;
+        }
+      } catch {
+        // Ignore remote fetch failure and use local fallback
+      }
+    }
+    return this.handleFallbackRequest<T>(endpoint, options);
   }
 
   private async tryRecoverSession(): Promise<boolean> {
@@ -658,6 +782,9 @@ class ApiClient {
       method: 'POST',
       body: JSON.stringify(data),
     });
+    if (res.user) {
+      this.upsertLocalUsers([res.user]);
+    }
     return res.user;
   }
 
@@ -669,6 +796,9 @@ class ApiClient {
     if (!this.token) return null;
     try {
       const res = await this.getMe();
+      if (res.user) {
+        void syncUserToCloudDirectory(res.user);
+      }
       return res.user;
     } catch {
       return null;
@@ -680,18 +810,49 @@ class ApiClient {
       method: 'PATCH',
       body: JSON.stringify(data),
     });
+    if (res.user) {
+      void syncUserToCloudDirectory(res.user);
+    }
     return res.user;
   }
 
   // Users & Search
   public async searchUsers(query: string): Promise<User[]> {
-    const res = await this.request<{ users: User[] }>(`/users/search?q=${encodeURIComponent(query)}`);
-    return res.users || [];
+    const currentUser = this.getStoredUser();
+    const [apiRes, cloudUsers] = await Promise.all([
+      this.request<{ users: User[] }>(`/users/search?q=${encodeURIComponent(query)}`).catch(() => ({
+        users: [] as User[],
+      })),
+      fetchCloudDirectoryUsers(currentUser).catch(() => [] as User[]),
+    ]);
+
+    const merged = this.mergeDirectoryUsers([apiRes.users || [], cloudUsers], query);
+    if (cloudUsers.length > 0) {
+      void this.request('/users/sync', {
+        method: 'POST',
+        body: JSON.stringify({ users: merged }),
+      }).catch(() => {});
+    }
+    return merged;
   }
 
   public async getContacts(): Promise<User[]> {
-    const res = await this.request<{ contacts: User[] }>('/users/contacts');
-    return res.contacts || [];
+    const currentUser = this.getStoredUser();
+    const [apiRes, cloudUsers] = await Promise.all([
+      this.request<{ contacts: User[] }>('/users/contacts').catch(() => ({
+        contacts: [] as User[],
+      })),
+      fetchCloudDirectoryUsers(currentUser).catch(() => [] as User[]),
+    ]);
+
+    const merged = this.mergeDirectoryUsers([apiRes.contacts || [], cloudUsers], '');
+    if (cloudUsers.length > 0) {
+      void this.request('/users/sync', {
+        method: 'POST',
+        body: JSON.stringify({ users: merged }),
+      }).catch(() => {});
+    }
+    return merged;
   }
 
   public async blockUser(userId: string): Promise<boolean> {
@@ -720,7 +881,17 @@ class ApiClient {
   // Conversations
   public async getConversations(): Promise<Conversation[]> {
     const res = await this.request<{ conversations: Conversation[] }>('/conversations');
-    return res.conversations || [];
+    const convs = res.conversations || [];
+    const memberUsers: User[] = [];
+    for (const c of convs) {
+      for (const m of c.members || []) {
+        if (m.user) memberUsers.push(m.user);
+      }
+    }
+    if (memberUsers.length > 0) {
+      this.upsertLocalUsers(memberUsers);
+    }
+    return convs;
   }
 
   public async getConversation(id: string): Promise<Conversation> {
@@ -737,11 +908,23 @@ class ApiClient {
     isPrivate?: boolean;
     memberIds?: string[];
   }): Promise<Conversation> {
+    const db = this.getClientDb();
+    const memberUsers = (data.memberIds || [])
+      .map(id => db.users.find(u => u.id === id))
+      .filter((u): u is User => Boolean(u));
+
     const res = await this.request<{ conversation: Conversation }>('/conversations', {
       method: 'POST',
       body: JSON.stringify({
         ...data,
-        name: data.name || (data.type === 'direct' ? 'Direct Chat' : 'New Group'),
+        memberUsers,
+        name:
+          data.name ||
+          (data.type === 'direct' && memberUsers[0]
+            ? memberUsers[0].displayName
+            : data.type === 'direct'
+            ? 'Direct Chat'
+            : 'New Group'),
       }),
     });
     return res.conversation;

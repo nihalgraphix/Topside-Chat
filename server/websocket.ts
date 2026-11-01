@@ -78,6 +78,10 @@ export class AetherSocketServer {
         const userId = data.userId;
         if (!userId) return;
 
+        if (data.user && typeof data.user === 'object') {
+          db.upsertExternalUsers([data.user]);
+        }
+
         ws.userId = userId;
         if (!this.userSockets.has(userId)) {
           this.userSockets.set(userId, new Set());

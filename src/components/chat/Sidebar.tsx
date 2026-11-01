@@ -18,10 +18,12 @@ import { Conversation, User, Story } from '../../types';
 interface SidebarProps {
   currentUser: User;
   conversations: Conversation[];
+  contacts?: User[];
   stories?: Story[];
   activeConversationId: string | null;
   typingUsers: Record<string, string>;
   onSelectConversation: (id: string) => void;
+  onStartDirectChat?: (user: User) => void;
   onOpenNewConversation: (defaultType?: 'direct' | 'group' | 'channel') => void;
   onOpenSettings: () => void;
   onOpenAdmin: () => void;
@@ -35,9 +37,11 @@ interface SidebarProps {
 export const Sidebar: React.FC<SidebarProps> = ({
   currentUser,
   conversations,
+  contacts = [],
   activeConversationId,
   typingUsers,
   onSelectConversation,
+  onStartDirectChat,
   onOpenNewConversation,
   onOpenSettings,
   onLogout,
@@ -69,6 +73,25 @@ export const Sidebar: React.FC<SidebarProps> = ({
   const displayedConversations = categoryFiltered
     .filter(matchesSearch)
     .sort((a, b) => (b.isPinned ? 1 : 0) - (a.isPinned ? 1 : 0));
+
+  const matchedContacts = contacts.filter(u => {
+    if (u.id === currentUser.id) return false;
+    if (u.email && currentUser.email && u.email.toLowerCase() === currentUser.email.toLowerCase()) return false;
+    if (u.username && currentUser.username && u.username.toLowerCase() === currentUser.username.toLowerCase()) return false;
+    if (!searchQuery.trim()) {
+      // Only show in directory section if not already in a direct conversation with them
+      const hasDirect = conversations.some(
+        c => c.type === 'direct' && c.members.some(m => m.userId === u.id || m.user?.username === u.username)
+      );
+      return !hasDirect;
+    }
+    const q = searchQuery.trim().toLowerCase().replace(/^@/, '');
+    return (
+      u.displayName.toLowerCase().includes(q) ||
+      u.username.toLowerCase().includes(q) ||
+      (u.email && u.email.toLowerCase().includes(q))
+    );
+  });
 
   const renderSubtitle = (c: Conversation) => {
     const isTyping = typingUsers[c.id];
@@ -229,21 +252,21 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
       {/* Scrollable Conversation Stream */}
       <div className="flex-1 overflow-y-auto px-3 pb-24 scrollbar-none space-y-1 pt-2">
-        {conversations.length === 0 && (
+        {conversations.length === 0 && matchedContacts.length === 0 && (
           <div className="py-12 px-4 text-center flex flex-col items-center justify-center">
             <div className="w-12 h-12 rounded-2xl bg-white/5 border border-white/15 flex items-center justify-center text-white mb-3">
               <MessageSquare className="w-6 h-6" />
             </div>
             <h4 className="text-sm font-bold text-white mb-1">No conversations yet</h4>
             <p className="text-xs text-neutral-400 max-w-[200px] mb-4 leading-relaxed">
-              Start a new conversation or invite a contact to begin chatting.
+              Start a new conversation or search contacts to begin chatting.
             </p>
             <button
               onClick={() => onOpenNewConversation('direct')}
               className="px-4 py-2 rounded-xl bg-white text-black text-xs font-bold hover:bg-neutral-200 transition flex items-center gap-1.5 cursor-pointer"
             >
               <Plus className="w-3.5 h-3.5" />
-              <span>Start New Chat</span>
+              <span>Add & Search Contacts</span>
             </button>
           </div>
         )}
@@ -296,6 +319,53 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 </div>
               );
             })}
+          </div>
+        )}
+
+        {matchedContacts.length > 0 && (
+          <div className="pt-3 space-y-1">
+            <div className="px-2 pb-1 flex items-center justify-between">
+              <span className="text-[10px] font-bold uppercase tracking-wider text-neutral-400">
+                People on Aether ({matchedContacts.length})
+              </span>
+              <button
+                onClick={() => onOpenNewConversation('direct')}
+                className="text-[10px] font-semibold text-white hover:underline cursor-pointer"
+              >
+                View All
+              </button>
+            </div>
+            {matchedContacts.map(user => (
+              <div
+                key={user.id}
+                onClick={() => {
+                  if (onStartDirectChat) {
+                    onStartDirectChat(user);
+                  } else {
+                    onOpenNewConversation('direct');
+                  }
+                }}
+                className="flex items-center justify-between gap-3 p-2.5 rounded-xl cursor-pointer transition border bg-transparent border-transparent hover:bg-[#111111] hover:border-white/10"
+              >
+                <div className="flex items-center gap-3 min-w-0">
+                  <div className="relative shrink-0">
+                    <div className="w-9 h-9 rounded-full bg-[#1a1a1a] text-white border border-white/20 flex items-center justify-center font-bold text-xs select-none">
+                      {user.displayName.charAt(0).toUpperCase()}
+                    </div>
+                    {user.isOnline && (
+                      <span className="w-2.5 h-2.5 rounded-full bg-white border-2 border-black absolute bottom-0 right-0" />
+                    )}
+                  </div>
+                  <div className="min-w-0">
+                    <div className="text-xs font-bold text-white truncate">{user.displayName}</div>
+                    <div className="text-[11px] text-neutral-400 truncate">@{user.username}</div>
+                  </div>
+                </div>
+                <span className="px-2.5 py-1 rounded-lg bg-white text-black text-[10px] font-bold shrink-0">
+                  Chat
+                </span>
+              </div>
+            ))}
           </div>
         )}
       </div>

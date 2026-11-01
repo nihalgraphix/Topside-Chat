@@ -1,5 +1,5 @@
-import React, { useState, useEffect } from 'react';
-import { X, Search, Users, MessageSquare, Check, Sparkles, UserPlus } from 'lucide-react';
+import React, { useState, useEffect, useCallback } from 'react';
+import { X, Search, Users, MessageSquare, Check, Sparkles, UserPlus, RefreshCw, Loader2 } from 'lucide-react';
 import { User } from '../../types';
 import { Avatar } from '../common/Avatar';
 import { api } from '../../lib/api';
@@ -8,6 +8,7 @@ interface NewConversationModalProps {
   isOpen: boolean;
   initialType?: 'direct' | 'group' | 'channel';
   currentUser: User;
+  initialContacts?: User[];
   onClose: () => void;
   onCreated: (conversationId: string) => void;
 }
@@ -16,56 +17,95 @@ export const NewConversationModal: React.FC<NewConversationModalProps> = ({
   isOpen,
   initialType = 'direct',
   currentUser,
+  initialContacts = [],
   onClose,
   onCreated,
 }) => {
   const [tab, setTab] = useState<'direct' | 'group'>(initialType === 'group' ? 'group' : 'direct');
-  const [users, setUsers] = useState<User[]>([]);
+  const [users, setUsers] = useState<User[]>(initialContacts);
   const [search, setSearch] = useState('');
   const [selectedUserIds, setSelectedUserIds] = useState<string[]>([]);
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isLoadingUsers, setIsLoadingUsers] = useState(false);
 
   // New Contact fields for quick adding
   const [showAddContact, setShowAddContact] = useState(false);
   const [contactEmail, setContactEmail] = useState('');
   const [contactError, setContactError] = useState<string | null>(null);
 
-  const loadUsers = async () => {
+  const loadUsers = useCallback(async (showSpinner = false) => {
+    if (showSpinner) setIsLoadingUsers(true);
     try {
-      const list = await api.searchUsers('');
-      setUsers(list);
+      const [searched, contacts] = await Promise.all([
+        api.searchUsers(''),
+        api.getContacts(),
+      ]);
+      const byKey = new Map<string, User>();
+      for (const u of [...initialContacts, ...searched, ...contacts]) {
+        if (!u || !u.id) continue;
+        const key = (u.username || u.email || u.id).toLowerCase();
+        if (!byKey.has(key)) {
+          byKey.set(key, u);
+        }
+      }
+      setUsers(Array.from(byKey.values()));
     } catch (err) {
       console.error(err);
+    } finally {
+      if (showSpinner) setIsLoadingUsers(false);
     }
-  };
+  }, [initialContacts]);
 
   useEffect(() => {
-    if (isOpen) {
-      loadUsers();
-      setContactError(null);
+    if (initialContacts.length > 0 && users.length === 0) {
+      setUsers(initialContacts);
     }
-  }, [isOpen]);
+  }, [initialContacts, users.length]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    loadUsers(users.length === 0);
+    setContactError(null);
+    const interval = setInterval(() => {
+      loadUsers(false);
+    }, 5000);
+    return () => clearInterval(interval);
+  }, [isOpen, loadUsers]);
 
   if (!isOpen) return null;
 
-  const filteredUsers = users.filter(u => {
-    if (u.id === currentUser.id) return false;
+  const isSelfUser = (u: User) => {
+    if (u.id === currentUser.id) return true;
+    if (u.email && currentUser.email && u.email.toLowerCase() === currentUser.email.toLowerCase()) return true;
+    if (u.username && currentUser.username && u.username.toLowerCase() === currentUser.username.toLowerCase()) return true;
+    return false;
+  };
+
+  const validOtherUsers = users.filter(u => {
+    if (isSelfUser(u)) return false;
     if (
       u.id === 'u_1789118066028_c7hyx' ||
+      u.username === 'directory_reader' ||
+      u.username === 'guest_viewer' ||
       /john\s*fran/i.test(u.displayName || '') ||
       /john\s*fran/i.test(u.username || '') ||
       /john\s*fran/i.test(u.email || '')
     ) {
       return false;
     }
+    return true;
+  });
+
+  const filteredUsers = validOtherUsers.filter(u => {
     if (!search.trim()) return true;
-    const q = search.toLowerCase();
+    const q = search.trim().toLowerCase().replace(/^@/, '');
     return (
       u.displayName.toLowerCase().includes(q) ||
       u.username.toLowerCase().includes(q) ||
-      (u.email && u.email.toLowerCase().includes(q))
+      (u.email && u.email.toLowerCase().includes(q)) ||
+      (u.phone && u.phone.toLowerCase().includes(q))
     );
   });
 
@@ -96,17 +136,17 @@ export const NewConversationModal: React.FC<NewConversationModalProps> = ({
     }
   };
 
-  const handleCreateNewContact = async (e: React.FormEvent) => {
-    e.preventDefault();
-    const query = contactEmail.trim().toLowerCase();
-    if (!query) return;
+  const handleQuickAddAndChat = async (rawQuery: string) => {
+    const queryStr = rawQuery.trim();
+    if (!queryStr) return;
 
     setContactError(null);
     setIsSubmitting(true);
     try {
       const foundUser = await api.createContact({
-        email: query,
-        username: query,
+        name: queryStr.includes('@') ? undefined : queryStr,
+        email: queryStr.includes('@') ? queryStr.toLowerCase() : undefined,
+        username: queryStr.toLowerCase().replace(/^@/, ''),
       });
       const conv = await api.createConversation({
         type: 'direct',
@@ -116,10 +156,15 @@ export const NewConversationModal: React.FC<NewConversationModalProps> = ({
       onClose();
     } catch (err: any) {
       console.error(err);
-      setContactError(err.message || 'User not found. Only registered and signed-in members can be added.');
+      setContactError(err.message || 'Could not add contact.');
     } finally {
       setIsSubmitting(false);
     }
+  };
+
+  const handleCreateNewContact = async (e: React.FormEvent) => {
+    e.preventDefault();
+    await handleQuickAddAndChat(contactEmail);
   };
 
   const handleCreateGroup = async (e: React.FormEvent) => {
@@ -150,7 +195,7 @@ export const NewConversationModal: React.FC<NewConversationModalProps> = ({
         <div className="flex items-center justify-between pb-4 border-b border-white/10">
           <div className="flex items-center gap-2">
             <Sparkles className="w-5 h-5 text-white" />
-            <h3 className="text-base font-bold text-white">New Conversation</h3>
+            <h3 className="text-base font-bold text-white">Add & Search Contacts</h3>
           </div>
           <button
             onClick={onClose}
@@ -203,10 +248,19 @@ export const NewConversationModal: React.FC<NewConversationModalProps> = ({
                   type="text"
                   value={search}
                   onChange={e => setSearch(e.target.value)}
-                  placeholder="Search contacts..."
+                  placeholder="Search by name, @username, or email..."
                   className="w-full pl-9 pr-4 py-2 rounded-xl bg-[#141414] border border-white/10 text-xs text-white placeholder-neutral-500 focus:outline-none focus:border-white/40"
                 />
               </div>
+
+              <button
+                type="button"
+                onClick={() => loadUsers(true)}
+                title="Refresh contacts directory"
+                className="p-2 rounded-xl bg-[#141414] hover:bg-white/10 text-neutral-300 border border-white/10 transition cursor-pointer"
+              >
+                <RefreshCw className={`w-4 h-4 ${isLoadingUsers ? 'animate-spin text-white' : ''}`} />
+              </button>
 
               <button
                 type="button"
@@ -229,9 +283,8 @@ export const NewConversationModal: React.FC<NewConversationModalProps> = ({
                 <div className="text-xs font-semibold text-white flex items-center justify-between">
                   <div className="flex items-center gap-1.5">
                     <UserPlus className="w-3.5 h-3.5" />
-                    <span>Find & Add Signed-in Person</span>
+                    <span>Add Contact by Email, @Username, or Name</span>
                   </div>
-                  <span className="text-[10px] text-neutral-400">Registered users only</span>
                 </div>
                 <input
                   type="text"
@@ -241,7 +294,7 @@ export const NewConversationModal: React.FC<NewConversationModalProps> = ({
                     setContactEmail(e.target.value);
                     if (contactError) setContactError(null);
                   }}
-                  placeholder="Enter user email or @username..."
+                  placeholder="Enter email, @username, or display name..."
                   className="w-full px-3 py-2 rounded-xl bg-black border border-white/15 text-xs text-white placeholder-neutral-500 focus:outline-none focus:border-white/40"
                 />
                 {contactError && (
@@ -252,27 +305,76 @@ export const NewConversationModal: React.FC<NewConversationModalProps> = ({
                   disabled={isSubmitting || !contactEmail.trim()}
                   className="w-full py-2 rounded-xl bg-white text-black font-bold text-xs shadow-md hover:bg-neutral-200 disabled:opacity-50 transition cursor-pointer"
                 >
-                  {isSubmitting ? 'Searching...' : 'Find & Add Contact'}
+                  {isSubmitting ? 'Starting Chat...' : 'Add & Start Chat'}
                 </button>
               </form>
             )}
 
+            <div className="flex items-center justify-between px-1 mb-2">
+              <span className="text-[11px] font-bold uppercase tracking-wider text-neutral-400">
+                People Using Aether ({filteredUsers.length})
+              </span>
+              {isLoadingUsers && (
+                <span className="text-[11px] text-neutral-400 flex items-center gap-1">
+                  <Loader2 className="w-3 h-3 animate-spin" />
+                  Syncing directory...
+                </span>
+              )}
+            </div>
+
             {/* Contact List */}
-            <div className="flex-1 overflow-y-auto space-y-1 pr-1">
+            <div className="flex-1 overflow-y-auto space-y-1.5 pr-1">
+              {search.trim() && (
+                <div
+                  onClick={() => handleQuickAddAndChat(search)}
+                  className="flex items-center justify-between p-2.5 rounded-2xl bg-white/5 hover:bg-white/10 border border-white/15 cursor-pointer transition mb-2"
+                >
+                  <div className="flex items-center gap-3 min-w-0">
+                    <div className="w-9 h-9 rounded-full bg-white text-black flex items-center justify-center shrink-0">
+                      <UserPlus className="w-4 h-4" />
+                    </div>
+                    <div className="min-w-0">
+                      <div className="text-xs font-bold text-white truncate">
+                        Add & Chat with "{search.trim()}"
+                      </div>
+                      <div className="text-[10px] text-neutral-400 truncate">
+                        Start a direct conversation immediately
+                      </div>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    disabled={isSubmitting}
+                    className="px-3 py-1.5 rounded-xl bg-white text-black text-xs font-bold hover:bg-neutral-200 transition cursor-pointer shrink-0"
+                  >
+                    Start Chat
+                  </button>
+                </div>
+              )}
+
               {filteredUsers.length === 0 ? (
-                <div className="py-10 text-center text-xs text-neutral-400 px-4">
-                  <p className="font-semibold text-white mb-1">No signed-in users found</p>
-                  <p className="text-[11px] text-neutral-500 mb-3">
-                    Only persons who are signed in to Aether will appear in your contacts.
-                  </p>
-                  {!showAddContact && (
-                    <button
-                      onClick={() => setShowAddContact(true)}
-                      className="text-white font-semibold hover:underline inline-flex items-center gap-1"
-                    >
-                      <UserPlus className="w-3.5 h-3.5" />
-                      Find member by email
-                    </button>
+                <div className="py-8 text-center text-xs text-neutral-400 px-4">
+                  {isLoadingUsers ? (
+                    <div className="flex flex-col items-center gap-2">
+                      <Loader2 className="w-6 h-6 animate-spin text-white" />
+                      <p className="text-xs text-neutral-300">Finding people who use Aether...</p>
+                    </div>
+                  ) : (
+                    <>
+                      <p className="font-semibold text-white mb-1">No other contacts matched</p>
+                      <p className="text-[11px] text-neutral-500 mb-3">
+                        Type any person's email, @username, or name above to add them and start chatting right away.
+                      </p>
+                      {!showAddContact && (
+                        <button
+                          onClick={() => setShowAddContact(true)}
+                          className="px-4 py-2 rounded-xl bg-white text-black font-bold text-xs hover:bg-neutral-200 inline-flex items-center gap-1.5 cursor-pointer transition"
+                        >
+                          <UserPlus className="w-3.5 h-3.5" />
+                          <span>Add Contact by Email / Username</span>
+                        </button>
+                      )}
+                    </>
                   )}
                 </div>
               ) : (
@@ -280,16 +382,21 @@ export const NewConversationModal: React.FC<NewConversationModalProps> = ({
                   <div
                     key={user.id}
                     onClick={() => toggleUserSelection(user.id)}
-                    className="flex items-center justify-between p-2.5 rounded-2xl hover:bg-white/5 cursor-pointer transition"
+                    className="flex items-center justify-between p-2.5 rounded-2xl hover:bg-white/5 border border-transparent hover:border-white/10 cursor-pointer transition"
                   >
                     <div className="flex items-center gap-3 min-w-0">
                       <Avatar name={user.displayName} src={user.avatarUrl} isOnline={user.isOnline} size="md" />
                       <div className="min-w-0">
                         <div className="text-xs font-semibold text-white truncate">{user.displayName}</div>
-                        <div className="text-[10px] text-neutral-400 truncate">{user.email || `@${user.username}`}</div>
+                        <div className="text-[10px] text-neutral-400 truncate">
+                          @{user.username}
+                          {user.email && !user.email.endsWith('@aether.chat') && !user.email.endsWith('@aether.local')
+                            ? ` • ${user.email}`
+                            : ''}
+                        </div>
                       </div>
                     </div>
-                    <button className="px-3 py-1.5 rounded-xl bg-white text-black text-xs font-bold hover:bg-neutral-200 transition cursor-pointer">
+                    <button className="px-3 py-1.5 rounded-xl bg-white text-black text-xs font-bold hover:bg-neutral-200 transition cursor-pointer shrink-0">
                       Chat
                     </button>
                   </div>
@@ -332,35 +439,36 @@ export const NewConversationModal: React.FC<NewConversationModalProps> = ({
                 Select Members ({selectedUserIds.length})
               </label>
               <div className="flex-1 overflow-y-auto space-y-1 pr-1 border border-white/10 rounded-xl p-2 bg-[#141414]">
-                {users.filter(u => u.id !== currentUser.id).length === 0 ? (
+                {validOtherUsers.length === 0 ? (
                   <div className="text-center py-4 text-xs text-neutral-500">No other users yet</div>
                 ) : (
-                  users
-                    .filter(u => u.id !== currentUser.id)
-                    .map(user => {
-                      const isSelected = selectedUserIds.includes(user.id);
-                      return (
-                        <div
-                          key={user.id}
-                          onClick={() => toggleUserSelection(user.id)}
-                          className={`flex items-center justify-between p-2 rounded-xl cursor-pointer transition ${
-                            isSelected ? 'bg-white/15 border border-white/30' : 'hover:bg-white/5'
-                          }`}
-                        >
-                          <div className="flex items-center gap-2 min-w-0">
-                            <Avatar name={user.displayName} src={user.avatarUrl} size="sm" />
-                            <span className="text-xs text-white truncate">{user.displayName}</span>
-                          </div>
-                          <div
-                            className={`w-4 h-4 rounded-md border flex items-center justify-center ${
-                              isSelected ? 'bg-white border-white text-black' : 'border-white/20'
-                            }`}
-                          >
-                            {isSelected && <Check className="w-3 h-3 stroke-[3]" />}
+                  validOtherUsers.map(user => {
+                    const isSelected = selectedUserIds.includes(user.id);
+                    return (
+                      <div
+                        key={user.id}
+                        onClick={() => toggleUserSelection(user.id)}
+                        className={`flex items-center justify-between p-2 rounded-xl cursor-pointer transition ${
+                          isSelected ? 'bg-white/15 border border-white/30' : 'hover:bg-white/5'
+                        }`}
+                      >
+                        <div className="flex items-center gap-2 min-w-0">
+                          <Avatar name={user.displayName} src={user.avatarUrl} size="sm" />
+                          <div className="min-w-0">
+                            <div className="text-xs text-white truncate">{user.displayName}</div>
+                            <div className="text-[10px] text-neutral-400 truncate">@{user.username}</div>
                           </div>
                         </div>
-                      );
-                    })
+                        <div
+                          className={`w-4 h-4 rounded-md border flex items-center justify-center ${
+                            isSelected ? 'bg-white border-white text-black' : 'border-white/20'
+                          }`}
+                        >
+                          {isSelected && <Check className="w-3 h-3 stroke-[3]" />}
+                        </div>
+                      </div>
+                    );
+                  })
                 )}
               </div>
             </div>

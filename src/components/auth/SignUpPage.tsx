@@ -2,8 +2,7 @@ import React, { useState } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { Eye, EyeOff, Loader2, CheckCircle2, AlertCircle, Sparkles, Mail, Lock, User as UserIcon, ArrowRight, ShieldCheck } from 'lucide-react';
 import { signInWithPopup, signInWithEmailAndPassword, createUserWithEmailAndPassword, sendPasswordResetEmail } from 'firebase/auth';
-import { doc, setDoc } from 'firebase/firestore';
-import { auth, db, googleProvider, handleFirestoreError, OperationType } from '../../lib/firebase';
+import { auth, googleProvider, syncUserToCloudDirectory } from '../../lib/firebase';
 import { api } from '../../lib/api';
 import { User } from '../../types';
 
@@ -30,38 +29,7 @@ export const SignUpPage: React.FC<SignUpPageProps> = ({ onSuccess }) => {
   const [googleName, setGoogleName] = useState('');
 
   const syncUserToFirestore = async (user: User) => {
-    const uid = auth.currentUser?.uid;
-    if (!uid) return;
-    try {
-      await setDoc(
-        doc(db, 'users', uid),
-        {
-          uid,
-          username: user.username,
-          displayName: user.displayName,
-          avatarUrl: user.avatarUrl || '',
-          bio: user.bio || '',
-          onlineStatus: 'online',
-          createdAt: user.createdAt || new Date().toISOString(),
-        },
-        { merge: true }
-      );
-      await setDoc(
-        doc(db, 'users', uid, 'private', 'info'),
-        {
-          uid,
-          email: user.email,
-          updatedAt: new Date().toISOString(),
-        },
-        { merge: true }
-      );
-    } catch (err) {
-      try {
-        handleFirestoreError(err, OperationType.WRITE, `users/${uid}`);
-      } catch {
-        // Non-blocking sync
-      }
-    }
+    await syncUserToCloudDirectory(user);
   };
 
   const handleSubmit = async (e: React.FormEvent) => {

@@ -34,11 +34,12 @@ export function useSocket(currentUser: User | null, handlers: SocketEventHandler
 
       ws.onopen = () => {
         setIsConnected(true);
-        // Authenticate socket
+        // Authenticate socket and register user profile
         ws.send(
           JSON.stringify({
             type: 'auth',
             userId: currentUser.id,
+            user: currentUser,
           })
         );
       };

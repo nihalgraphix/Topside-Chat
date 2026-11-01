@@ -582,7 +582,46 @@ export default function App() {
 
   useEffect(() => {
     loadCallsAndContacts();
-  }, [loadCallsAndContacts]);
+    if (!currentUser) return;
+    const timer = setInterval(() => {
+      loadCallsAndContacts();
+    }, 8000);
+    return () => clearInterval(timer);
+  }, [loadCallsAndContacts, currentUser]);
+
+  const handleStartDirectChatWithUser = useCallback(
+    async (targetUser: User) => {
+      if (!currentUser) return;
+      try {
+        const existing = conversations.find(
+          c =>
+            c.type === 'direct' &&
+            c.members.some(
+              m =>
+                m.userId === targetUser.id ||
+                (m.user?.username &&
+                  targetUser.username &&
+                  m.user.username.toLowerCase() === targetUser.username.toLowerCase())
+            )
+        );
+        if (existing) {
+          setActiveConversationId(existing.id);
+          return;
+        }
+        const conv = await api.createConversation({
+          type: 'direct',
+          name: targetUser.displayName,
+          avatarUrl: targetUser.avatarUrl,
+          memberIds: [targetUser.id],
+        });
+        await loadConversationsAndStories();
+        setActiveConversationId(conv.id);
+      } catch (err) {
+        console.error('Failed to start direct chat with user', err);
+      }
+    },
+    [currentUser, conversations, loadConversationsAndStories]
+  );
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -762,10 +801,12 @@ export default function App() {
                 <Sidebar
                   currentUser={currentUser}
                   conversations={conversations}
+                  contacts={contactsList}
                   stories={stories}
                   activeConversationId={activeConversationId}
                   typingUsers={typingUsers}
                   onSelectConversation={id => setActiveConversationId(id)}
+                  onStartDirectChat={handleStartDirectChatWithUser}
                   onOpenNewConversation={type => {
                     setNewConvType(type || 'direct');
                     setIsNewConvOpen(true);
@@ -884,6 +925,7 @@ export default function App() {
         onSuccess={user => {
           setCurrentUser(user);
           loadConversationsAndStories();
+          loadCallsAndContacts();
           addToast({
             type: 'success',
             title: 'Authenticated',
@@ -898,9 +940,11 @@ export default function App() {
           isOpen={isNewConvOpen}
           initialType={newConvType}
           currentUser={currentUser}
+          initialContacts={contactsList}
           onClose={() => setIsNewConvOpen(false)}
           onCreated={convId => {
             loadConversationsAndStories();
+            loadCallsAndContacts();
             setActiveConversationId(convId);
           }}
         />

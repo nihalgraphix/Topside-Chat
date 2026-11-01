@@ -12,7 +12,19 @@ async function startServer() {
   const app = express();
   const PORT = 3000;
 
-  // Basic middleware
+  // Basic middleware & CORS for cross-origin static deployments
+  app.use((req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, PUT, DELETE, OPTIONS');
+    res.setHeader(
+      'Access-Control-Allow-Headers',
+      'Content-Type, Authorization, X-User-Id, X-User-Email, X-User-Name, X-User-Username, X-User-Avatar'
+    );
+    if (req.method === 'OPTIONS') {
+      return res.sendStatus(204);
+    }
+    next();
+  });
   app.use(express.json({ limit: '50mb' }));
   app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 

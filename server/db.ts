@@ -1,5 +1,25 @@
 import fs from 'fs';
 import path from 'path';
+import { initializeApp, getApps } from 'firebase/app';
+import {
+  getAuth,
+  signInWithEmailAndPassword,
+  createUserWithEmailAndPassword,
+} from 'firebase/auth';
+import {
+  getFirestore,
+  doc,
+  getDoc,
+  setDoc,
+  updateDoc,
+  collection,
+  query,
+  where,
+  limit,
+  getDocs,
+  serverTimestamp,
+} from 'firebase/firestore';
+import firebaseConfig from '../firebase-applet-config.json';
 import { sqlStorage } from './sqlDb';
 import {
   User,
@@ -14,6 +34,12 @@ import {
   BlockedUser,
   UserSettings,
 } from '../src/types';
+
+const serverFirebaseApp =
+  getApps().find(a => a.name === 'aether-server-sync') ||
+  initializeApp(firebaseConfig, 'aether-server-sync');
+const serverFirestore = getFirestore(serverFirebaseApp, firebaseConfig.firestoreDatabaseId);
+const serverAuth = getAuth(serverFirebaseApp);
 
 interface DatabaseSchema {
   users: (User & { passwordHash: string })[];
@@ -44,10 +70,153 @@ if (!fs.existsSync(UPLOADS_DIR)) {
 class AetherDatabase {
   private data: DatabaseSchema;
   private saveTimeout: NodeJS.Timeout | null = null;
+  private isCloudSyncing = false;
+  private lastCloudPullAt = 0;
 
   constructor() {
     this.data = this.load();
     this.initSql();
+    void this.initCloudSync();
+  }
+
+  private async initCloudSync(): Promise<void> {
+    try {
+      for (const u of this.data.users) {
+        await this.publishUserToCloud(u);
+      }
+      await this.pullUsersFromCloud(true);
+    } catch {
+      // Non-blocking startup cloud sync
+    }
+  }
+
+  public async publishUserToCloud(user: User): Promise<void> {
+    if (!user || !user.id) return;
+    try {
+      const rawKey = (user.username || user.email?.split('@')[0] || user.id || 'member')
+        .toLowerCase()
+        .replace(/[^a-z0-9]/g, '')
+        .slice(0, 24) || 'member';
+      const syncEmail = `mesh_${rawKey}@aetherchat.app`;
+      const syncPass = `AetherMesh#2026#${rawKey}`;
+
+      let uid: string | undefined;
+      try {
+        const cred = await signInWithEmailAndPassword(serverAuth, syncEmail, syncPass);
+        uid = cred.user.uid;
+      } catch {
+        const created = await createUserWithEmailAndPassword(serverAuth, syncEmail, syncPass);
+        uid = created.user.uid;
+      }
+      if (!uid) return;
+
+      let cleanUsername = (user.username || user.displayName || 'user')
+        .trim()
+        .toLowerCase()
+        .replace(/^@/, '')
+        .replace(/[^a-z0-9_]/g, '_')
+        .slice(0, 32);
+      if (cleanUsername.length < 2) cleanUsername = `user_${cleanUsername || '1'}`;
+
+      const cleanDisplayName = (user.displayName || cleanUsername).trim().slice(0, 64) || 'User';
+      const cleanAppUserId = (user.id || uid).replace(/[^a-zA-Z0-9_\-]/g, '_').slice(0, 128);
+      const cleanAvatarUrl = (
+        user.avatarUrl ||
+        `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(cleanDisplayName)}`
+      ).slice(0, 1024);
+      const cleanBio = (user.bio || 'Member of the encrypted communications mesh.').slice(0, 256);
+
+      const userRef = doc(serverFirestore, 'users', uid);
+      const snap = await getDoc(userRef);
+
+      if (!snap.exists()) {
+        await setDoc(userRef, {
+          uid,
+          appUserId: cleanAppUserId,
+          username: cleanUsername,
+          displayName: cleanDisplayName,
+          avatarUrl: cleanAvatarUrl,
+          bio: cleanBio,
+          isOnline: true,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      } else {
+        await updateDoc(userRef, {
+          appUserId: cleanAppUserId,
+          username: cleanUsername,
+          displayName: cleanDisplayName,
+          avatarUrl: cleanAvatarUrl,
+          bio: cleanBio,
+          isOnline: true,
+          updatedAt: serverTimestamp(),
+        });
+      }
+    } catch {
+      // Ignore transient cloud sync errors
+    }
+  }
+
+  public async pullUsersFromCloud(force = false): Promise<User[]> {
+    const now = Date.now();
+    if (this.isCloudSyncing || (!force && now - this.lastCloudPullAt < 4000)) {
+      return this.getUsers();
+    }
+    this.isCloudSyncing = true;
+    this.lastCloudPullAt = now;
+    try {
+      if (!serverAuth.currentUser) {
+        const syncEmail = 'mesh_directory_reader@aetherchat.app';
+        const syncPass = 'AetherMesh#2026#directory_reader';
+        try {
+          await signInWithEmailAndPassword(serverAuth, syncEmail, syncPass);
+        } catch {
+          await createUserWithEmailAndPassword(serverAuth, syncEmail, syncPass);
+        }
+      }
+      if (!serverAuth.currentUser) return this.getUsers();
+
+      const q = query(
+        collection(serverFirestore, 'users'),
+        where('isOnline', 'in', [true, false]),
+        limit(100)
+      );
+      const snapshot = await getDocs(q);
+      const cloudUsers: Partial<User>[] = [];
+
+      snapshot.forEach(docSnap => {
+        const data = docSnap.data();
+        if (!data || !data.username || !data.displayName) return;
+        if (data.username === 'directory_reader' || data.username === 'guest_viewer') return;
+
+        cloudUsers.push({
+          id: data.appUserId || data.uid || docSnap.id,
+          username: data.username,
+          displayName: data.displayName,
+          email: `${data.username}@aether.chat`,
+          avatarUrl:
+            data.avatarUrl ||
+            `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(data.displayName)}`,
+          bio: data.bio || 'Member of the encrypted communications mesh.',
+          onlineStatus: data.isOnline ? 'online' : 'offline',
+          isOnline: Boolean(data.isOnline),
+          createdAt:
+            data.createdAt && typeof data.createdAt.toDate === 'function'
+              ? data.createdAt.toDate().toISOString()
+              : new Date().toISOString(),
+          role: 'user',
+        });
+      });
+
+      if (cloudUsers.length > 0) {
+        this.upsertExternalUsers(cloudUsers, false);
+      }
+    } catch {
+      // Ignore cloud read error
+    } finally {
+      this.isCloudSyncing = false;
+    }
+    return this.getUsers();
   }
 
   private async initSql(): Promise<void> {
@@ -206,6 +375,81 @@ class AetherDatabase {
     return this.data.users.map(({ passwordHash, ...user }) => user);
   }
 
+  public upsertExternalUsers(incomingUsers: Partial<User>[], publishToCloud = true): User[] {
+    let changed = false;
+
+    for (const raw of incomingUsers) {
+      if (!raw || (!raw.id && !raw.username && !raw.email)) continue;
+      const cleanEmail = (raw.email || '').trim().toLowerCase();
+      const cleanUsername = (raw.username || cleanEmail.split('@')[0] || raw.displayName || '')
+        .trim()
+        .toLowerCase()
+        .replace(/^@/, '')
+        .replace(/[^a-z0-9_]/g, '_');
+
+      if (!cleanUsername || cleanUsername === 'directory_reader' || cleanUsername === 'guest_viewer') {
+        continue;
+      }
+
+      const existingIdx = this.data.users.findIndex(
+        u =>
+          (raw.id && u.id === raw.id) ||
+          (cleanUsername && u.username.toLowerCase() === cleanUsername) ||
+          (cleanEmail && u.email && u.email.toLowerCase() === cleanEmail)
+      );
+
+      if (existingIdx >= 0) {
+        const curr = this.data.users[existingIdx];
+        let updated = false;
+        if (raw.displayName && raw.displayName !== curr.displayName) {
+          curr.displayName = raw.displayName;
+          updated = true;
+        }
+        if (raw.avatarUrl && !curr.avatarUrl) {
+          curr.avatarUrl = raw.avatarUrl;
+          updated = true;
+        }
+        if (updated) changed = true;
+      } else {
+        const displayName =
+          (raw.displayName || cleanUsername)
+            .trim() || 'User';
+        const newUser: User & { passwordHash: string } = {
+          id: raw.id || `u_ext_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          username: cleanUsername.slice(0, 28),
+          displayName,
+          email: cleanEmail || `${cleanUsername}@aether.chat`,
+          phone: raw.phone,
+          avatarUrl:
+            raw.avatarUrl ||
+            `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(displayName)}`,
+          bio: raw.bio || 'Member of the encrypted communications mesh.',
+          onlineStatus: raw.isOnline ? 'online' : 'online',
+          isOnline: true,
+          lastSeen: new Date().toISOString(),
+          createdAt: raw.createdAt || new Date().toISOString(),
+          role: 'user',
+          passwordHash: '',
+        };
+        this.data.users.push(newUser);
+        changed = true;
+        try {
+          sqlStorage.saveUser(newUser, '');
+        } catch {
+          // Ignore SQLite error
+        }
+        if (publishToCloud) {
+          void this.publishUserToCloud(newUser);
+        }
+      }
+    }
+
+    if (changed) {
+      this.queueSave();
+    }
+    return this.getUsers();
+  }
+
   public getUserById(id: string): User | undefined {
     const user = this.data.users.find(u => u.id === id);
     if (!user) return undefined;
@@ -260,6 +504,7 @@ class AetherDatabase {
       console.error('Failed to save user to SQLite', err);
     }
     const { passwordHash, ...safeUser } = user;
+    void this.publishUserToCloud(safeUser);
     return safeUser;
   }
 
@@ -275,6 +520,7 @@ class AetherDatabase {
       console.error('Failed to update user in SQLite', err);
     }
     const { passwordHash, ...safeUser } = this.data.users[idx];
+    void this.publishUserToCloud(safeUser);
     return safeUser;
   }
 

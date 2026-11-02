@@ -16,14 +16,34 @@ import {
   fetchStoriesFromFirestore,
   getCanonicalDirectConversationId,
   cacheDirectoryUsers,
+  clearDirectoryUserCache,
+  purgeAllCloudDataFromFirestore,
 } from './firebase';
 
 const REMOTE_API_ORIGIN = 'https://ais-pre-jpz57iqlur4hyo5s2f2gkp-455372508405.asia-southeast1.run.app';
+const STORAGE_EPOCH = 'aether_purge_20261102_v3';
 
 class ApiClient {
   private token: string | null = null;
 
   constructor() {
+    if (typeof window !== 'undefined') {
+      try {
+        if (localStorage.getItem('aether_storage_epoch') !== STORAGE_EPOCH) {
+          localStorage.removeItem('aether_client_db');
+          localStorage.removeItem('aether_deleted_convs');
+          localStorage.removeItem('aether_user');
+          localStorage.removeItem('aether_token');
+          localStorage.removeItem('aether_cached_directory_users');
+          localStorage.setItem('aether_storage_epoch', STORAGE_EPOCH);
+          clearDirectoryUserCache();
+          void signOutFirebaseSession();
+          void purgeAllCloudDataFromFirestore();
+        }
+      } catch {
+        // Ignore storage errors
+      }
+    }
     this.token = typeof window !== 'undefined' ? localStorage.getItem('aether_token') : null;
   }
 
@@ -1711,6 +1731,21 @@ class ApiClient {
   }
 
   public async resetAllData(): Promise<{ success: boolean; message: string }> {
+    if (typeof window !== 'undefined') {
+      try {
+        localStorage.removeItem('aether_client_db');
+        localStorage.removeItem('aether_deleted_convs');
+        localStorage.removeItem('aether_user');
+        localStorage.removeItem('aether_token');
+        localStorage.removeItem('aether_cached_directory_users');
+      } catch {
+        // Ignore storage error
+      }
+    }
+    this.token = null;
+    clearDirectoryUserCache();
+    await purgeAllCloudDataFromFirestore().catch(() => {});
+    void signOutFirebaseSession();
     return this.request<{ success: boolean; message: string }>('/system/reset', {
       method: 'POST',
     });

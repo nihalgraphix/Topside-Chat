@@ -46,6 +46,10 @@ export function cacheDirectoryUsers(users: User[]) {
   }
 }
 
+export function clearDirectoryUserCache() {
+  directoryUserCache.clear();
+}
+
 export enum OperationType {
   CREATE = 'create',
   UPDATE = 'update',
@@ -463,18 +467,25 @@ export async function syncUserToCloudDirectory(user: User | null | undefined): P
   }
 }
 
+const PURGED_APP_USER_IDS = new Set([
+  'u_1793542551003_u6d1q',
+  'u_1793542529768_2hell',
+  'u_g_1789118321867_ri6j',
+  'u_1793542689808_tgcbq',
+  'u_1793542584643_kbekr',
+]);
+
 /**
  * Fetches all registered users from the shared Firestore `/users` directory.
  */
 export async function fetchCloudDirectoryUsers(currentUser?: User | null): Promise<User[]> {
-  if (currentUser) {
+  if (currentUser && (!currentUser.id || !PURGED_APP_USER_IDS.has(currentUser.id))) {
     void syncUserToCloudDirectory(currentUser);
   }
 
   try {
     const q = query(
       collection(db, 'users'),
-      where('isOnline', 'in', [true, false]),
       limit(100)
     );
     const snap = await getDocs(q);
@@ -490,6 +501,7 @@ export async function fetchCloudDirectoryUsers(currentUser?: User | null): Promi
         typeof data.appUserId === 'string' && data.appUserId.length > 0
           ? data.appUserId
           : docSnap.id;
+      if (PURGED_APP_USER_IDS.has(resolvedId)) return;
 
       list.push({
         id: resolvedId,
@@ -1526,3 +1538,62 @@ export async function fetchStoriesFromFirestore(): Promise<Story[]> {
     return [];
   }
 }
+
+export async function purgeAllCloudDataFromFirestore(): Promise<void> {
+  directoryUserCache.clear();
+  const knownUids = new Set<string>([
+    'muhammed_nihal_on',
+    'nihal1382010',
+    'nihal_graphix',
+    'nihal_graphix_gmail_com',
+    'nihal_on',
+    'u_1793542551003_u6d1q',
+    'u_1793542529768_2hell',
+    'u_g_1789118321867_ri6j',
+    'u_1793542689808_tgcbq',
+    'u_1793542584643_kbekr',
+  ]);
+  try {
+    const snap = await getDocs(
+      query(collection(db, 'users'), limit(100))
+    );
+    snap.forEach(d => {
+      knownUids.add(d.id);
+      const data = d.data();
+      if (data?.appUserId) knownUids.add(sanitizeId(String(data.appUserId), 'u'));
+      if (data?.uid) knownUids.add(sanitizeId(String(data.uid), 'u'));
+    });
+  } catch {
+    // Ignore
+  }
+
+  for (const uid of knownUids) {
+    for (const sub of ['conversations', 'messages', 'files', 'notes']) {
+      try {
+        const subSnap = await getDocs(query(collection(db, 'users', uid, sub), limit(200)));
+        for (const docSnap of subSnap.docs) {
+          await deleteDoc(doc(db, 'users', uid, sub, docSnap.id)).catch(() => {});
+        }
+      } catch {
+        // Ignore
+      }
+    }
+    try {
+      await deleteDoc(doc(db, 'users', uid)).catch(() => {});
+    } catch {
+      // Ignore
+    }
+  }
+
+  try {
+    const storiesSnap = await getDocs(
+      query(collection(db, 'stories'), limit(100))
+    );
+    for (const sDoc of storiesSnap.docs) {
+      await deleteDoc(doc(db, 'stories', sDoc.id)).catch(() => {});
+    }
+  } catch {
+    // Ignore
+  }
+}
+

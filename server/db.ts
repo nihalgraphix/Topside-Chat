@@ -12,6 +12,7 @@ import {
   getDoc,
   setDoc,
   updateDoc,
+  deleteDoc,
   collection,
   query,
   where,
@@ -57,7 +58,29 @@ interface DatabaseSchema {
 
 const DATA_DIR = path.join(process.cwd(), 'data');
 const DB_FILE = path.join(DATA_DIR, 'aether.db.json');
+const PURGE_MARKER_FILE = path.join(DATA_DIR, 'purge_20261102_v3.done');
 const UPLOADS_DIR = path.join(process.cwd(), 'uploads');
+
+export const PURGED_USER_IDS = new Set([
+  'u_alex',
+  'u_jerima',
+  'u_lu',
+  'u_muzi',
+  'u_jia',
+  'u_amy',
+  'u_surf',
+  'u_dalonzo',
+  'u_frank',
+  'u_alice',
+  'u_admin',
+  'u_bot',
+  'u_1789118066028_c7hyx',
+  'u_1793542551003_u6d1q',
+  'u_1793542529768_2hell',
+  'u_g_1789118321867_ri6j',
+  'u_1793542689808_tgcbq',
+  'u_1793542584643_kbekr',
+]);
 
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -75,12 +98,20 @@ class AetherDatabase {
 
   constructor() {
     this.data = this.load();
+    if (!fs.existsSync(PURGE_MARKER_FILE)) {
+      this.clearAllData();
+    }
     this.initSql();
     void this.initCloudSync();
   }
 
   private async initCloudSync(): Promise<void> {
     try {
+      if (!fs.existsSync(PURGE_MARKER_FILE)) {
+        await this.purgeAllData();
+        fs.writeFileSync(PURGE_MARKER_FILE, new Date().toISOString(), 'utf-8');
+        return;
+      }
       for (const u of this.data.users) {
         await this.publishUserToCloud(u);
       }
@@ -92,6 +123,7 @@ class AetherDatabase {
 
   public async publishUserToCloud(user: User): Promise<void> {
     if (!user || (!user.id && !user.username)) return;
+    if (user.id && PURGED_USER_IDS.has(user.id)) return;
     try {
       let cleanUsername = (user.username || user.displayName || 'user')
         .trim()
@@ -105,6 +137,7 @@ class AetherDatabase {
       const docId = cleanUsername;
       const cleanDisplayName = (user.displayName || cleanUsername).trim().slice(0, 64) || 'User';
       const cleanAppUserId = (user.id || docId).replace(/[^a-zA-Z0-9_\-]/g, '_').slice(0, 128);
+      if (PURGED_USER_IDS.has(cleanAppUserId)) return;
       const cleanAvatarUrl = (
         user.avatarUrl ||
         `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(cleanDisplayName)}`
@@ -152,7 +185,6 @@ class AetherDatabase {
     try {
       const q = query(
         collection(serverFirestore, 'users'),
-        where('isOnline', 'in', [true, false]),
         limit(100)
       );
       const snapshot = await getDocs(q);
@@ -162,9 +194,11 @@ class AetherDatabase {
         const data = docSnap.data();
         if (!data || !data.username || !data.displayName) return;
         if (data.username === 'directory_reader' || data.username === 'guest_viewer') return;
+        const resolvedId = data.appUserId || data.uid || docSnap.id;
+        if (PURGED_USER_IDS.has(resolvedId)) return;
 
         cloudUsers.push({
-          id: data.appUserId || data.uid || docSnap.id,
+          id: resolvedId,
           username: data.username,
           displayName: data.displayName,
           email: `${data.username}@aether.chat`,
@@ -238,21 +272,7 @@ class AetherDatabase {
   }
 
   private load(): DatabaseSchema {
-    const DEMO_USER_IDS = new Set([
-      'u_alex',
-      'u_jerima',
-      'u_lu',
-      'u_muzi',
-      'u_jia',
-      'u_amy',
-      'u_surf',
-      'u_dalonzo',
-      'u_frank',
-      'u_alice',
-      'u_admin',
-      'u_bot',
-      'u_1789118066028_c7hyx',
-    ]);
+    const DEMO_USER_IDS = PURGED_USER_IDS;
 
     const isDemoConversation = (id: string) =>
       id === 'c_jerima' ||
@@ -354,8 +374,75 @@ class AetherDatabase {
     }, 100);
   }
 
+  public async purgeAllData(): Promise<void> {
+    const knownUserDocIds = new Set<string>();
+    for (const u of this.data.users) {
+      if (u.username) {
+        const cleanU = u.username.trim().toLowerCase().replace(/^@/, '').replace(/[^a-z0-9_]/g, '_').slice(0, 32);
+        if (cleanU) knownUserDocIds.add(cleanU);
+      }
+      if (u.id) {
+        const cleanId = u.id.trim().replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 120);
+        if (cleanId) knownUserDocIds.add(cleanId);
+      }
+    }
+
+    this.clearAllData();
+
+    try {
+      const usersSnap = await getDocs(
+        query(collection(serverFirestore, 'users'), limit(100))
+      );
+      usersSnap.forEach(d => {
+        knownUserDocIds.add(d.id);
+        const data = d.data();
+        if (data?.appUserId) {
+          knownUserDocIds.add(String(data.appUserId).replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 120));
+        }
+        if (data?.uid) {
+          knownUserDocIds.add(String(data.uid).replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 120));
+        }
+      });
+    } catch {
+      // Ignore query error
+    }
+
+    for (const uid of knownUserDocIds) {
+      const subcollections = ['conversations', 'messages', 'files', 'notes'];
+      for (const sub of subcollections) {
+        try {
+          const subSnap = await getDocs(query(collection(serverFirestore, 'users', uid, sub), limit(200)));
+          for (const subDoc of subSnap.docs) {
+            await deleteDoc(doc(serverFirestore, 'users', uid, sub, subDoc.id)).catch(() => {});
+          }
+        } catch {
+          // Ignore subcollection error
+        }
+      }
+      try {
+        await deleteDoc(doc(serverFirestore, 'users', uid)).catch(() => {});
+      } catch {
+        // Ignore user delete error
+      }
+    }
+
+    try {
+      const storiesSnap = await getDocs(
+        query(collection(serverFirestore, 'stories'), limit(100))
+      );
+      for (const sDoc of storiesSnap.docs) {
+        await deleteDoc(doc(serverFirestore, 'stories', sDoc.id)).catch(() => {});
+      }
+    } catch {
+      // Ignore stories delete error
+    }
+
+    this.clearAllData();
+  }
+
   public resetAllData(): void {
     this.clearAllData();
+    void this.purgeAllData();
   }
 
   // --- Users API ---
@@ -368,6 +455,7 @@ class AetherDatabase {
 
     for (const raw of incomingUsers) {
       if (!raw || (!raw.id && !raw.username && !raw.email)) continue;
+      if (raw.id && PURGED_USER_IDS.has(raw.id)) continue;
       const cleanEmail = (raw.email || '').trim().toLowerCase();
       const cleanUsername = (raw.username || cleanEmail.split('@')[0] || raw.displayName || '')
         .trim()

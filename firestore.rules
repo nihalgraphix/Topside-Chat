@@ -31,12 +31,29 @@ service cloud.firestore {
       return isValidId(userId) && (request.auth == null || request.auth.uid == userId || isValidId(request.auth.uid));
     }
 
+    function isNotPurgedAppUserId(id) {
+      return !(id in [
+        'u_1793542551003_u6d1q',
+        'u_1793542529768_2hell',
+        'u_g_1789118321867_ri6j',
+        'u_1793542689808_tgcbq',
+        'u_1793542584643_kbekr'
+      ]);
+    }
+
+    function isNotPurgedConvId(id) {
+      return !(id in [
+        'c_1793542551048_7x6d',
+        'c_1793552699466_ghiy'
+      ]);
+    }
+
     // 3. Entity Validation Blueprints
     function isValidUserPublicProfile(data, userId) {
       return data.keys().hasAll(['uid', 'username', 'displayName', 'isOnline', 'createdAt', 'updatedAt'])
         && data.keys().hasOnly(['uid', 'appUserId', 'username', 'displayName', 'avatarUrl', 'bio', 'isOnline', 'createdAt', 'updatedAt'])
         && data.uid is string && data.uid.size() >= 1 && data.uid.size() <= 128 && data.uid == userId
-        && (!('appUserId' in data) || (data.appUserId is string && data.appUserId.size() >= 1 && data.appUserId.size() <= 128 && isValidId(data.appUserId)))
+        && (!('appUserId' in data) || (data.appUserId is string && data.appUserId.size() >= 1 && data.appUserId.size() <= 128 && isValidId(data.appUserId) && isNotPurgedAppUserId(data.appUserId)))
         && data.username is string && data.username.size() >= 2 && data.username.size() <= 32 && data.username.matches('^[a-zA-Z0-9_]+$')
         && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 64
         && (!('avatarUrl' in data) || (data.avatarUrl is string && data.avatarUrl.size() <= 2048))
@@ -71,7 +88,7 @@ service cloud.firestore {
       return data.keys().hasAll(['ownerId', 'convId', 'type', 'name', 'memberIds', 'createdAt', 'updatedAt'])
         && data.keys().hasOnly(['ownerId', 'convId', 'type', 'name', 'description', 'avatarUrl', 'lastMessageText', 'memberIds', 'createdAt', 'updatedAt'])
         && data.ownerId is string && data.ownerId.size() >= 1 && data.ownerId.size() <= 128 && data.ownerId == userId
-        && data.convId is string && data.convId == conversationId && isValidId(data.convId)
+        && data.convId is string && data.convId == conversationId && isValidId(data.convId) && isNotPurgedConvId(data.convId)
         && (data.type == 'direct' || data.type == 'group')
         && data.name is string && data.name.size() >= 1 && data.name.size() <= 128
         && (!('description' in data) || (data.description is string && data.description.size() <= 512))
@@ -145,7 +162,8 @@ service cloud.firestore {
         && incoming().updatedAt == request.time
         && incoming().diff(existing()).affectedKeys().hasOnly(['appUserId', 'username', 'displayName', 'avatarUrl', 'bio', 'isOnline', 'updatedAt']);
 
-      allow delete: if false;
+      allow delete: if isDirectoryIdentity(userId)
+        && existing().uid == userId;
 
       match /private/{docId} {
         allow get: if isOwner(userId) && isValidId(userId) && isValidId(docId) && (resource == null || existing().uid == request.auth.uid);
@@ -169,7 +187,7 @@ service cloud.firestore {
           && incoming().diff(existing()).affectedKeys().hasOnly(['email', 'phone', 'updatedAt'])
           && get(/databases/$(database)/documents/users/$(userId)).data.uid == request.auth.uid;
 
-        allow delete: if false;
+        allow delete: if isOwner(userId) && isValidId(userId) && isValidId(docId) && existing().uid == request.auth.uid;
       }
 
       match /notes/{noteId} {

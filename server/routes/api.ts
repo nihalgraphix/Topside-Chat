@@ -4,7 +4,7 @@ import jwt from 'jsonwebtoken';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
-import { db } from '../db';
+import { db, PURGED_USER_IDS } from '../db';
 import { sqlStorage } from '../sqlDb';
 import { AetherSocketServer } from '../websocket';
 import { User, MessageType } from '../../src/types';
@@ -63,12 +63,19 @@ export const authenticate = (req: AuthRequest, res: Response, next: NextFunction
   const fallbackEmail = (req.headers['x-user-email'] as string | undefined)?.trim().toLowerCase();
   const fallbackName = (req.headers['x-user-name'] as string | undefined)?.trim();
 
+  if (fallbackUserId && PURGED_USER_IDS.has(fallbackUserId)) {
+    return res.status(401).json({ error: 'Session purged. Please sign in again.' });
+  }
+
   let user: User | undefined;
 
   if (authHeader && authHeader.startsWith('Bearer ')) {
     const token = authHeader.split(' ')[1];
     try {
       const decoded = jwt.verify(token, JWT_SECRET) as { id?: string; email?: string };
+      if (decoded?.id && PURGED_USER_IDS.has(decoded.id)) {
+        return res.status(401).json({ error: 'Session purged. Please sign in again.' });
+      }
       if (decoded?.id) {
         user = db.getUserById(decoded.id);
       }
@@ -81,6 +88,9 @@ export const authenticate = (req: AuthRequest, res: Response, next: NextFunction
         const decodedAny = jwt.decode(token) as Record<string, any> | null;
         if (decodedAny && typeof decodedAny === 'object') {
           const candidateId = decodedAny.id || decodedAny.user_id || decodedAny.sub;
+          if (candidateId && PURGED_USER_IDS.has(String(candidateId))) {
+            return res.status(401).json({ error: 'Session purged. Please sign in again.' });
+          }
           const candidateEmail = (decodedAny.email || '').toLowerCase().trim();
           if (candidateId) {
             user = db.getUserById(candidateId);
@@ -1421,16 +1431,16 @@ router.delete('/users/me/account', authenticate, (req: AuthRequest, res) => {
 });
 
 // --- HARD SYSTEM RESET ---
-router.post('/system/reset', (req, res) => {
-  db.resetAllData();
+router.post('/system/reset', async (req, res) => {
+  await db.purgeAllData();
   res.json({ success: true, message: 'All system data removed and reset to new.' });
 });
 
-router.post('/admin/reset-all', authenticate, (req: AuthRequest, res) => {
+router.post('/admin/reset-all', authenticate, async (req: AuthRequest, res) => {
   if (req.user!.role !== 'admin' && req.user!.role !== 'superadmin') {
     return res.status(403).json({ error: 'Admin access required' });
   }
-  db.resetAllData();
+  await db.purgeAllData();
   res.json({ success: true, message: 'All system data removed and reset to new.' });
 });
 

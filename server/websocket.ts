@@ -5,6 +5,7 @@ import { Message } from '../src/types';
 
 interface AuthenticatedSocket extends WebSocket {
   userId?: string;
+  userKeys?: Set<string>;
   isAlive?: boolean;
 }
 
@@ -18,6 +19,18 @@ export class AetherSocketServer {
     this.wss = new WebSocketServer({ server, path: '/ws' });
     this.setupListeners();
     this.setupHeartbeat();
+  }
+
+  private registerSocketKey(key: string | undefined, ws: AuthenticatedSocket) {
+    if (!key) return;
+    const clean = key.trim();
+    if (!clean) return;
+    if (!ws.userKeys) ws.userKeys = new Set();
+    ws.userKeys.add(clean);
+    if (!this.userSockets.has(clean)) {
+      this.userSockets.set(clean, new Set());
+    }
+    this.userSockets.get(clean)!.add(ws);
   }
 
   private setupListeners() {
@@ -38,20 +51,27 @@ export class AetherSocketServer {
       });
 
       ws.on('close', () => {
+        if (ws.userKeys) {
+          for (const key of ws.userKeys) {
+            const set = this.userSockets.get(key);
+            if (set) {
+              set.delete(ws);
+              if (set.size === 0) {
+                this.userSockets.delete(key);
+              }
+            }
+          }
+        }
         if (ws.userId) {
           const set = this.userSockets.get(ws.userId);
-          if (set) {
-            set.delete(ws);
-            if (set.size === 0) {
-              this.userSockets.delete(ws.userId);
-              db.setUserOnline(ws.userId, false);
-              this.broadcast({
-                type: 'presence:update',
-                userId: ws.userId,
-                isOnline: false,
-                lastSeen: new Date().toISOString(),
-              });
-            }
+          if (!set || set.size === 0) {
+            db.setUserOnline(ws.userId, false);
+            this.broadcast({
+              type: 'presence:update',
+              userId: ws.userId,
+              isOnline: false,
+              lastSeen: new Date().toISOString(),
+            });
           }
         }
       });
@@ -82,13 +102,28 @@ export class AetherSocketServer {
           db.upsertExternalUsers([data.user]);
         }
 
-        ws.userId = userId;
-        if (!this.userSockets.has(userId)) {
-          this.userSockets.set(userId, new Set());
-        }
-        this.userSockets.get(userId)!.add(ws);
+        const resolvedUser = db.getUserById(userId);
+        ws.userId = resolvedUser?.id || userId;
 
-        db.setUserOnline(userId, true);
+        this.registerSocketKey(userId, ws);
+        if (data.user?.id) this.registerSocketKey(String(data.user.id), ws);
+        if (data.user?.username) {
+          this.registerSocketKey(String(data.user.username).toLowerCase(), ws);
+          this.registerSocketKey(
+            String(data.user.username).toLowerCase().replace(/[^a-z0-9_]/g, '_'),
+            ws
+          );
+        }
+        if (resolvedUser) {
+          this.registerSocketKey(resolvedUser.id, ws);
+          this.registerSocketKey(resolvedUser.username.toLowerCase(), ws);
+          this.registerSocketKey(
+            resolvedUser.username.toLowerCase().replace(/[^a-z0-9_]/g, '_'),
+            ws
+          );
+        }
+
+        db.setUserOnline(ws.userId, true);
 
         // Send initial auth ack
         ws.send(JSON.stringify({ type: 'auth:ack', success: true }));
@@ -96,7 +131,7 @@ export class AetherSocketServer {
         // Broadcast presence
         this.broadcast({
           type: 'presence:update',
-          userId,
+          userId: ws.userId,
           isOnline: true,
           lastSeen: new Date().toISOString(),
         });
@@ -106,6 +141,9 @@ export class AetherSocketServer {
       case 'message:send': {
         if (!ws.userId) return;
         const msgData = data.message;
+        if (msgData?.conversationId) {
+          db.ensureConversationExists(msgData.conversationId, ws.userId);
+        }
         const saved = db.createMessage({
           ...msgData,
           senderId: ws.userId,
@@ -311,7 +349,7 @@ export class AetherSocketServer {
 
   public getCallSignalsForUser(callId: string, userId: string, afterSeq: number = 0) {
     const list = this.callSignals.get(callId) || [];
-    return list.filter(item => item.toUserId === userId && item.seq > afterSeq);
+    return list.filter(item => db.isSameUser(item.toUserId, userId) && item.seq > afterSeq);
   }
 
   public clearCallSignals(callId: string) {
@@ -329,11 +367,37 @@ export class AetherSocketServer {
     });
   }
 
+  private getSocketsForIdentity(userIdOrUsername: string): Set<AuthenticatedSocket> {
+    const result = new Set<AuthenticatedSocket>();
+    if (!userIdOrUsername) return result;
+
+    const candidateKeys = new Set<string>([
+      userIdOrUsername,
+      userIdOrUsername.toLowerCase(),
+      userIdOrUsername.toLowerCase().replace(/[^a-z0-9_]/g, '_'),
+    ]);
+
+    const resolved = db.getUserById(userIdOrUsername);
+    if (resolved) {
+      candidateKeys.add(resolved.id);
+      candidateKeys.add(resolved.username.toLowerCase());
+      candidateKeys.add(resolved.username.toLowerCase().replace(/[^a-z0-9_]/g, '_'));
+    }
+
+    for (const key of candidateKeys) {
+      const set = this.userSockets.get(key);
+      if (set) {
+        set.forEach(ws => result.add(ws));
+      }
+    }
+    return result;
+  }
+
   public sendToUser(userId: string, payload: any) {
-    const set = this.userSockets.get(userId);
-    if (!set) return;
+    const sockets = this.getSocketsForIdentity(userId);
+    if (sockets.size === 0) return;
     const raw = JSON.stringify(payload);
-    set.forEach(client => {
+    sockets.forEach(client => {
       if (client.readyState === WebSocket.OPEN) {
         client.send(raw);
       }
@@ -342,19 +406,39 @@ export class AetherSocketServer {
 
   public broadcastToConversation(conversationId: string, payload: any, excludeUserId?: string) {
     const conv = db.getConversationById(conversationId);
-    if (!conv) return;
+    const targetIdentities = new Set<string>();
 
-    const raw = JSON.stringify(payload);
-    conv.members.forEach(m => {
-      if (excludeUserId && m.userId === excludeUserId) return;
-      const set = this.userSockets.get(m.userId);
-      if (set) {
-        set.forEach(client => {
-          if (client.readyState === WebSocket.OPEN) {
-            client.send(raw);
-          }
-        });
+    if (conv) {
+      for (const m of conv.members) {
+        if (m.userId) targetIdentities.add(m.userId);
+        if (m.user?.username) targetIdentities.add(m.user.username.toLowerCase());
       }
-    });
+    }
+
+    if (conversationId && conversationId.startsWith('c_dm_')) {
+      const dmParts = conversationId.slice('c_dm_'.length).split('__').filter(Boolean);
+      for (const p of dmParts) {
+        targetIdentities.add(p);
+      }
+    }
+
+    if (targetIdentities.size === 0) return;
+
+    const sentSockets = new Set<AuthenticatedSocket>();
+    const raw = JSON.stringify(payload);
+
+    for (const identity of targetIdentities) {
+      if (excludeUserId && db.isSameUser(identity, excludeUserId)) continue;
+      const sockets = this.getSocketsForIdentity(identity);
+      sockets.forEach(client => {
+        if (excludeUserId && client.userId && db.isSameUser(client.userId, excludeUserId)) {
+          return;
+        }
+        if (!sentSockets.has(client) && client.readyState === WebSocket.OPEN) {
+          sentSockets.add(client);
+          client.send(raw);
+        }
+      });
+    }
   }
 }

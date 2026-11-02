@@ -12,6 +12,8 @@ import {
   Command,
   Check,
   CheckCheck,
+  Trash2,
+  X,
 } from 'lucide-react';
 import { Conversation, User, Story } from '../../types';
 
@@ -32,6 +34,8 @@ interface SidebarProps {
   onOpenCreateStory?: () => void;
   onOpenCommandPalette?: () => void;
   onOpenCallsHistory?: () => void;
+  onDeleteConversation?: (id: string) => void;
+  onTogglePinConversation?: (id: string) => void;
 }
 
 export const Sidebar: React.FC<SidebarProps> = ({
@@ -47,11 +51,14 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onLogout,
   onOpenCommandPalette,
   onOpenCallsHistory,
+  onDeleteConversation,
+  onTogglePinConversation,
 }) => {
   const [searchQuery, setSearchQuery] = useState('');
   const [activeTab, setActiveTab] = useState<'all' | 'direct' | 'group' | 'saved'>('all');
   const [showProfileMenu, setShowProfileMenu] = useState(false);
   const [activeBottomNav, setActiveBottomNav] = useState<'message' | 'calls' | 'profile'>('message');
+  const [confirmDeleteConvId, setConfirmDeleteConvId] = useState<string | null>(null);
 
   // Filter conversations by category tab (excluding channels)
   const categoryFiltered = conversations
@@ -275,11 +282,16 @@ export const Sidebar: React.FC<SidebarProps> = ({
           <div className="space-y-1">
             {displayedConversations.map(conv => {
               const isSelected = activeConversationId === conv.id;
+              const isConfirmingDelete = confirmDeleteConvId === conv.id;
               return (
                 <div
                   key={conv.id}
-                  onClick={() => onSelectConversation(conv.id)}
-                  className={`flex items-center gap-3 p-2.5 rounded-xl cursor-pointer transition border ${
+                  onClick={() => {
+                    if (!isConfirmingDelete) {
+                      onSelectConversation(conv.id);
+                    }
+                  }}
+                  className={`group flex items-center gap-3 p-2.5 rounded-xl cursor-pointer transition border relative ${
                     isSelected
                       ? 'bg-[#161616] border-white/30'
                       : 'bg-transparent border-transparent hover:bg-[#111111] hover:border-white/10'
@@ -303,19 +315,80 @@ export const Sidebar: React.FC<SidebarProps> = ({
                   </div>
 
                   <div className="flex-1 min-w-0">
-                    <div className="flex items-center justify-between">
+                    <div className="flex items-center justify-between gap-2">
                       <div className="flex items-center gap-1.5 min-w-0">
                         <span className="text-xs font-bold text-white truncate">{conv.name}</span>
                         {conv.isPinned && (
                           <Bookmark className="w-3 h-3 text-white fill-white shrink-0" />
                         )}
                       </div>
-                      <span className="text-[11px] font-mono text-neutral-400 shrink-0">{getTimeLabel(conv)}</span>
+                      <span className="text-[11px] font-mono text-neutral-400 shrink-0 group-hover:hidden">
+                        {getTimeLabel(conv)}
+                      </span>
                     </div>
-                    <div className="text-xs text-neutral-400 truncate mt-0.5">
+                    <div className="text-xs text-neutral-400 truncate mt-0.5 pr-6">
                       {renderSubtitle(conv)}
                     </div>
                   </div>
+
+                  {/* Quick Hover Actions: Pin & Delete Chat */}
+                  {isConfirmingDelete ? (
+                    <div
+                      onClick={e => e.stopPropagation()}
+                      className="flex items-center gap-1 bg-black/95 border border-white/25 rounded-lg p-1 z-10 shrink-0"
+                    >
+                      <button
+                        onClick={e => {
+                          e.stopPropagation();
+                          setConfirmDeleteConvId(null);
+                          onDeleteConversation?.(conv.id);
+                        }}
+                        className="px-2 py-1 rounded bg-white text-black text-[10px] font-bold hover:bg-neutral-200 transition cursor-pointer"
+                      >
+                        Delete
+                      </button>
+                      <button
+                        onClick={e => {
+                          e.stopPropagation();
+                          setConfirmDeleteConvId(null);
+                        }}
+                        title="Cancel"
+                        className="p-1 rounded text-neutral-400 hover:text-white hover:bg-white/10 transition cursor-pointer"
+                      >
+                        <X className="w-3 h-3" />
+                      </button>
+                    </div>
+                  ) : (
+                    <div
+                      onClick={e => e.stopPropagation()}
+                      className="hidden group-hover:flex items-center gap-1 absolute right-2.5 top-2 z-10 bg-[#111111]/95 border border-white/15 rounded-lg p-0.5 shadow-lg"
+                    >
+                      {onTogglePinConversation && (
+                        <button
+                          onClick={e => {
+                            e.stopPropagation();
+                            onTogglePinConversation(conv.id);
+                          }}
+                          title={conv.isPinned ? 'Unpin conversation' : 'Pin conversation'}
+                          className="p-1 rounded text-neutral-400 hover:text-white hover:bg-white/10 transition cursor-pointer"
+                        >
+                          <Bookmark className={`w-3.5 h-3.5 ${conv.isPinned ? 'fill-white text-white' : ''}`} />
+                        </button>
+                      )}
+                      {onDeleteConversation && (
+                        <button
+                          onClick={e => {
+                            e.stopPropagation();
+                            setConfirmDeleteConvId(conv.id);
+                          }}
+                          title="Delete conversation"
+                          className="p-1 rounded text-neutral-400 hover:text-white hover:bg-white/15 transition cursor-pointer"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      )}
+                    </div>
+                  )}
                 </div>
               );
             })}

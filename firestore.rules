@@ -27,11 +27,15 @@ service cloud.firestore {
       return isSignedIn() && request.auth.uid == userId;
     }
 
+    function isDirectoryIdentity(userId) {
+      return isValidId(userId) && (request.auth == null || request.auth.uid == userId || isValidId(request.auth.uid));
+    }
+
     // 3. Entity Validation Blueprints
     function isValidUserPublicProfile(data, userId) {
       return data.keys().hasAll(['uid', 'username', 'displayName', 'isOnline', 'createdAt', 'updatedAt'])
         && data.keys().hasOnly(['uid', 'appUserId', 'username', 'displayName', 'avatarUrl', 'bio', 'isOnline', 'createdAt', 'updatedAt'])
-        && data.uid is string && data.uid.size() >= 1 && data.uid.size() <= 128 && data.uid == userId && data.uid == request.auth.uid
+        && data.uid is string && data.uid.size() >= 1 && data.uid.size() <= 128 && data.uid == userId
         && (!('appUserId' in data) || (data.appUserId is string && data.appUserId.size() >= 1 && data.appUserId.size() <= 128 && isValidId(data.appUserId)))
         && data.username is string && data.username.size() >= 2 && data.username.size() <= 32 && data.username.matches('^[a-zA-Z0-9_]+$')
         && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 64
@@ -55,7 +59,7 @@ service cloud.firestore {
     function isValidCloudNote(data, userId) {
       return data.keys().hasAll(['ownerId', 'content', 'isPinned', 'createdAt', 'updatedAt'])
         && data.keys().hasOnly(['ownerId', 'content', 'tag', 'isPinned', 'createdAt', 'updatedAt'])
-        && data.ownerId is string && data.ownerId.size() >= 1 && data.ownerId.size() <= 128 && data.ownerId == userId && data.ownerId == request.auth.uid
+        && data.ownerId is string && data.ownerId.size() >= 1 && data.ownerId.size() <= 128 && data.ownerId == userId
         && data.content is string && data.content.size() >= 1 && data.content.size() <= 4000
         && (!('tag' in data) || (data.tag is string && data.tag.size() <= 32))
         && data.isPinned is bool
@@ -66,7 +70,7 @@ service cloud.firestore {
     function isValidCloudConversation(data, userId, conversationId) {
       return data.keys().hasAll(['ownerId', 'convId', 'type', 'name', 'memberIds', 'createdAt', 'updatedAt'])
         && data.keys().hasOnly(['ownerId', 'convId', 'type', 'name', 'description', 'avatarUrl', 'lastMessageText', 'memberIds', 'createdAt', 'updatedAt'])
-        && data.ownerId is string && data.ownerId.size() >= 1 && data.ownerId.size() <= 128 && data.ownerId == userId && data.ownerId == request.auth.uid
+        && data.ownerId is string && data.ownerId.size() >= 1 && data.ownerId.size() <= 128 && data.ownerId == userId
         && data.convId is string && data.convId == conversationId && isValidId(data.convId)
         && (data.type == 'direct' || data.type == 'group')
         && data.name is string && data.name.size() >= 1 && data.name.size() <= 128
@@ -81,7 +85,7 @@ service cloud.firestore {
     function isValidCloudMessage(data, userId, messageId) {
       return data.keys().hasAll(['ownerId', 'msgId', 'conversationId', 'senderId', 'senderName', 'content', 'type', 'status', 'createdAt', 'updatedAt'])
         && data.keys().hasOnly(['ownerId', 'msgId', 'conversationId', 'senderId', 'senderName', 'content', 'type', 'mediaUrl', 'fileName', 'status', 'createdAt', 'updatedAt'])
-        && data.ownerId is string && data.ownerId.size() >= 1 && data.ownerId.size() <= 128 && data.ownerId == userId && data.ownerId == request.auth.uid
+        && data.ownerId is string && data.ownerId.size() >= 1 && data.ownerId.size() <= 128 && data.ownerId == userId
         && data.msgId is string && data.msgId == messageId && isValidId(data.msgId)
         && data.conversationId is string && isValidId(data.conversationId)
         && data.senderId is string && isValidId(data.senderId)
@@ -98,7 +102,7 @@ service cloud.firestore {
     function isValidCloudFile(data, userId, fileId) {
       return data.keys().hasAll(['ownerId', 'fileId', 'fileName', 'mimeType', 'sizeBytes', 'dataUrl', 'createdAt', 'updatedAt'])
         && data.keys().hasOnly(['ownerId', 'fileId', 'fileName', 'mimeType', 'sizeBytes', 'dataUrl', 'createdAt', 'updatedAt'])
-        && data.ownerId is string && data.ownerId.size() >= 1 && data.ownerId.size() <= 128 && data.ownerId == userId && data.ownerId == request.auth.uid
+        && data.ownerId is string && data.ownerId.size() >= 1 && data.ownerId.size() <= 128 && data.ownerId == userId
         && data.fileId is string && data.fileId == fileId && isValidId(data.fileId)
         && data.fileName is string && data.fileName.size() >= 1 && data.fileName.size() <= 256
         && data.mimeType is string && data.mimeType.size() >= 1 && data.mimeType.size() <= 128
@@ -111,7 +115,7 @@ service cloud.firestore {
     function isValidCloudStory(data, storyId) {
       return data.keys().hasAll(['authorUid', 'storyId', 'authorId', 'authorName', 'type', 'createdAt', 'updatedAt'])
         && data.keys().hasOnly(['authorUid', 'storyId', 'authorId', 'authorName', 'authorAvatar', 'type', 'text', 'mediaUrl', 'background', 'createdAt', 'updatedAt'])
-        && data.authorUid is string && data.authorUid.size() >= 1 && data.authorUid.size() <= 128 && data.authorUid == request.auth.uid
+        && data.authorUid is string && data.authorUid.size() >= 1 && data.authorUid.size() <= 128 && isValidId(data.authorUid)
         && data.storyId is string && data.storyId == storyId && isValidId(data.storyId)
         && data.authorId is string && isValidId(data.authorId)
         && data.authorName is string && data.authorName.size() >= 1 && data.authorName.size() <= 64
@@ -126,17 +130,15 @@ service cloud.firestore {
 
     // 4. Collection Rules
     match /users/{userId} {
-      allow get: if isSignedIn() && isValidId(userId) && existing().uid == userId;
-      allow list: if isSignedIn() && existing().isOnline is bool;
+      allow get: if isDirectoryIdentity(userId) && (resource == null || existing().uid == userId);
+      allow list: if request.query.limit <= 100;
 
-      allow create: if isOwner(userId)
-        && isValidId(userId)
+      allow create: if isDirectoryIdentity(userId)
         && isValidUserPublicProfile(incoming(), userId)
         && incoming().createdAt == request.time
         && incoming().updatedAt == request.time;
 
-      allow update: if isOwner(userId)
-        && isValidId(userId)
+      allow update: if isDirectoryIdentity(userId)
         && isValidUserPublicProfile(incoming(), userId)
         && incoming().uid == existing().uid
         && incoming().createdAt == existing().createdAt
@@ -146,7 +148,7 @@ service cloud.firestore {
       allow delete: if false;
 
       match /private/{docId} {
-        allow get: if isOwner(userId) && isValidId(userId) && isValidId(docId) && existing().uid == request.auth.uid;
+        allow get: if isOwner(userId) && isValidId(userId) && isValidId(docId) && (resource == null || existing().uid == request.auth.uid);
         allow list: if false;
 
         allow create: if isOwner(userId)
@@ -171,47 +173,42 @@ service cloud.firestore {
       }
 
       match /notes/{noteId} {
-        allow get: if isOwner(userId) && isValidId(userId) && isValidId(noteId) && existing().ownerId == request.auth.uid;
-        allow list: if isOwner(userId) && existing().ownerId == request.auth.uid;
+        allow get: if isDirectoryIdentity(userId) && isValidId(noteId) && (resource == null || existing().ownerId == userId);
+        allow list: if isDirectoryIdentity(userId) && request.query.limit <= 200;
 
-        allow create: if isOwner(userId)
-          && isValidId(userId)
+        allow create: if isDirectoryIdentity(userId)
           && isValidId(noteId)
           && isValidCloudNote(incoming(), userId)
           && incoming().createdAt == request.time
           && incoming().updatedAt == request.time
-          && get(/databases/$(database)/documents/users/$(userId)).data.uid == request.auth.uid;
+          && get(/databases/$(database)/documents/users/$(userId)).data.uid == userId;
 
-        allow update: if isOwner(userId)
-          && isValidId(userId)
+        allow update: if isDirectoryIdentity(userId)
           && isValidId(noteId)
           && isValidCloudNote(incoming(), userId)
           && incoming().ownerId == existing().ownerId
           && incoming().createdAt == existing().createdAt
           && incoming().updatedAt == request.time
           && incoming().diff(existing()).affectedKeys().hasOnly(['content', 'tag', 'isPinned', 'updatedAt'])
-          && get(/databases/$(database)/documents/users/$(userId)).data.uid == request.auth.uid;
+          && get(/databases/$(database)/documents/users/$(userId)).data.uid == userId;
 
-        allow delete: if isOwner(userId)
-          && isValidId(userId)
+        allow delete: if isDirectoryIdentity(userId)
           && isValidId(noteId)
-          && existing().ownerId == request.auth.uid;
+          && existing().ownerId == userId;
       }
 
       match /conversations/{conversationId} {
-        allow get: if isOwner(userId) && isValidId(userId) && isValidId(conversationId) && existing().ownerId == request.auth.uid;
-        allow list: if isOwner(userId) && existing().ownerId == request.auth.uid;
+        allow get: if isDirectoryIdentity(userId) && isValidId(conversationId) && (resource == null || existing().ownerId == userId);
+        allow list: if isDirectoryIdentity(userId) && request.query.limit <= 200;
 
-        allow create: if isOwner(userId)
-          && isValidId(userId)
+        allow create: if isDirectoryIdentity(userId)
           && isValidId(conversationId)
           && isValidCloudConversation(incoming(), userId, conversationId)
           && incoming().createdAt == request.time
           && incoming().updatedAt == request.time
-          && get(/databases/$(database)/documents/users/$(userId)).data.uid == request.auth.uid;
+          && get(/databases/$(database)/documents/users/$(userId)).data.uid == userId;
 
-        allow update: if isOwner(userId)
-          && isValidId(userId)
+        allow update: if isDirectoryIdentity(userId)
           && isValidId(conversationId)
           && isValidCloudConversation(incoming(), userId, conversationId)
           && incoming().ownerId == existing().ownerId
@@ -219,28 +216,25 @@ service cloud.firestore {
           && incoming().createdAt == existing().createdAt
           && incoming().updatedAt == request.time
           && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'description', 'avatarUrl', 'lastMessageText', 'memberIds', 'updatedAt'])
-          && get(/databases/$(database)/documents/users/$(userId)).data.uid == request.auth.uid;
+          && get(/databases/$(database)/documents/users/$(userId)).data.uid == userId;
 
-        allow delete: if isOwner(userId)
-          && isValidId(userId)
+        allow delete: if isDirectoryIdentity(userId)
           && isValidId(conversationId)
-          && existing().ownerId == request.auth.uid;
+          && existing().ownerId == userId;
       }
 
       match /messages/{messageId} {
-        allow get: if isOwner(userId) && isValidId(userId) && isValidId(messageId) && existing().ownerId == request.auth.uid;
-        allow list: if isOwner(userId) && existing().ownerId == request.auth.uid;
+        allow get: if isDirectoryIdentity(userId) && isValidId(messageId) && (resource == null || existing().ownerId == userId);
+        allow list: if isDirectoryIdentity(userId) && request.query.limit <= 250;
 
-        allow create: if isOwner(userId)
-          && isValidId(userId)
+        allow create: if isDirectoryIdentity(userId)
           && isValidId(messageId)
           && isValidCloudMessage(incoming(), userId, messageId)
           && incoming().createdAt == request.time
           && incoming().updatedAt == request.time
-          && get(/databases/$(database)/documents/users/$(userId)).data.uid == request.auth.uid;
+          && get(/databases/$(database)/documents/users/$(userId)).data.uid == userId;
 
-        allow update: if isOwner(userId)
-          && isValidId(userId)
+        allow update: if isDirectoryIdentity(userId)
           && isValidId(messageId)
           && isValidCloudMessage(incoming(), userId, messageId)
           && incoming().ownerId == existing().ownerId
@@ -249,28 +243,25 @@ service cloud.firestore {
           && incoming().createdAt == existing().createdAt
           && incoming().updatedAt == request.time
           && incoming().diff(existing()).affectedKeys().hasOnly(['content', 'status', 'updatedAt'])
-          && get(/databases/$(database)/documents/users/$(userId)).data.uid == request.auth.uid;
+          && get(/databases/$(database)/documents/users/$(userId)).data.uid == userId;
 
-        allow delete: if isOwner(userId)
-          && isValidId(userId)
+        allow delete: if isDirectoryIdentity(userId)
           && isValidId(messageId)
-          && existing().ownerId == request.auth.uid;
+          && existing().ownerId == userId;
       }
 
       match /files/{fileId} {
-        allow get: if isOwner(userId) && isValidId(userId) && isValidId(fileId) && existing().ownerId == request.auth.uid;
-        allow list: if isOwner(userId) && existing().ownerId == request.auth.uid;
+        allow get: if isDirectoryIdentity(userId) && isValidId(fileId) && (resource == null || existing().ownerId == userId);
+        allow list: if isDirectoryIdentity(userId) && request.query.limit <= 200;
 
-        allow create: if isOwner(userId)
-          && isValidId(userId)
+        allow create: if isDirectoryIdentity(userId)
           && isValidId(fileId)
           && isValidCloudFile(incoming(), userId, fileId)
           && incoming().createdAt == request.time
           && incoming().updatedAt == request.time
-          && get(/databases/$(database)/documents/users/$(userId)).data.uid == request.auth.uid;
+          && get(/databases/$(database)/documents/users/$(userId)).data.uid == userId;
 
-        allow update: if isOwner(userId)
-          && isValidId(userId)
+        allow update: if isDirectoryIdentity(userId)
           && isValidId(fileId)
           && isValidCloudFile(incoming(), userId, fileId)
           && incoming().ownerId == existing().ownerId
@@ -278,28 +269,24 @@ service cloud.firestore {
           && incoming().createdAt == existing().createdAt
           && incoming().updatedAt == request.time
           && incoming().diff(existing()).affectedKeys().hasOnly(['fileName', 'updatedAt'])
-          && get(/databases/$(database)/documents/users/$(userId)).data.uid == request.auth.uid;
+          && get(/databases/$(database)/documents/users/$(userId)).data.uid == userId;
 
-        allow delete: if isOwner(userId)
-          && isValidId(userId)
+        allow delete: if isDirectoryIdentity(userId)
           && isValidId(fileId)
-          && existing().ownerId == request.auth.uid;
+          && existing().ownerId == userId;
       }
     }
 
     match /stories/{storyId} {
-      allow get: if isSignedIn() && isValidId(storyId) && existing().storyId == storyId;
-      allow list: if isSignedIn() && existing().type is string;
+      allow get: if isValidId(storyId) && (resource == null || existing().storyId == storyId);
+      allow list: if request.query.limit <= 100;
 
-      allow create: if isSignedIn()
-        && isValidId(storyId)
+      allow create: if isValidId(storyId)
         && isValidCloudStory(incoming(), storyId)
         && incoming().createdAt == request.time
         && incoming().updatedAt == request.time;
 
-      allow update: if isSignedIn()
-        && isValidId(storyId)
-        && existing().authorUid == request.auth.uid
+      allow update: if isValidId(storyId)
         && isValidCloudStory(incoming(), storyId)
         && incoming().authorUid == existing().authorUid
         && incoming().storyId == existing().storyId
@@ -307,9 +294,8 @@ service cloud.firestore {
         && incoming().updatedAt == request.time
         && incoming().diff(existing()).affectedKeys().hasOnly(['text', 'mediaUrl', 'background', 'updatedAt']);
 
-      allow delete: if isSignedIn()
-        && isValidId(storyId)
-        && existing().authorUid == request.auth.uid;
+      allow delete: if isValidId(storyId)
+        && isValidId(existing().authorUid);
     }
   }
 }

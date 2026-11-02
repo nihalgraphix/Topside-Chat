@@ -551,6 +551,54 @@ const filterOutSelf = (users: User[], self: User): User[] => {
   });
 };
 
+router.options('/users/directory', (_req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-User-Id, X-User-Email, X-User-Name');
+  res.status(204).end();
+});
+
+router.get('/users/directory', async (_req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  try {
+    await Promise.race([
+      db.pullUsersFromCloud(),
+      new Promise(resolve => setTimeout(resolve, 1500)),
+    ]);
+  } catch {
+    // Ignore timeout
+  }
+  const publicUsers = db.getUsers().map(u => ({
+    id: u.id,
+    username: u.username,
+    displayName: u.displayName,
+    avatarUrl: u.avatarUrl,
+    bio: u.bio,
+    onlineStatus: u.onlineStatus || 'online',
+    isOnline: Boolean(u.isOnline ?? true),
+    createdAt: u.createdAt,
+    role: u.role || 'user',
+  }));
+  res.json({ users: publicUsers });
+});
+
+router.post('/users/directory', async (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  try {
+    const incoming = Array.isArray(req.body?.users)
+      ? req.body.users
+      : req.body?.user
+      ? [req.body.user]
+      : [];
+    if (incoming.length > 0) {
+      db.upsertExternalUsers(incoming, true);
+    }
+    res.json({ users: db.getUsers() });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Directory sync failed' });
+  }
+});
+
 router.get('/users/search', authenticate, async (req: AuthRequest, res) => {
   try {
     await Promise.race([
@@ -581,7 +629,7 @@ router.post('/users/sync', authenticate, async (req: AuthRequest, res) => {
   try {
     const incoming = Array.isArray(req.body?.users) ? req.body.users : [];
     if (incoming.length > 0) {
-      db.upsertExternalUsers(incoming);
+      db.upsertExternalUsers(incoming, true);
     }
     const allUsers = filterOutSelf(db.getUsers(), req.user!);
     res.json({ users: allUsers });
@@ -715,7 +763,7 @@ router.get('/conversations', authenticate, (req: AuthRequest, res) => {
 });
 
 router.post('/conversations', authenticate, (req: AuthRequest, res) => {
-  const { type, name, description, avatarUrl, username, isPrivate, memberIds, memberUsers } = req.body;
+  const { id, type, name, description, avatarUrl, username, isPrivate, memberIds, memberUsers } = req.body;
 
   if (Array.isArray(memberUsers) && memberUsers.length > 0) {
     db.upsertExternalUsers(memberUsers, false);
@@ -725,7 +773,7 @@ router.post('/conversations', authenticate, (req: AuthRequest, res) => {
     // Check if direct conversation already exists with this user
     const existing = db.getUserConversations(req.user!.id).find(c => {
       if (c.type !== 'direct') return false;
-      return c.members.some(m => m.userId === memberIds[0]);
+      return c.members.some(m => db.isSameUser(m.userId, memberIds[0]));
     });
     if (existing) {
       return res.json({ conversation: existing });
@@ -733,6 +781,7 @@ router.post('/conversations', authenticate, (req: AuthRequest, res) => {
   }
 
   const created = db.createConversation(req.user!.id, {
+    id,
     type: type || 'direct',
     name: name || 'New Chat',
     description,
@@ -751,15 +800,65 @@ router.get('/conversations/:id', authenticate, (req: AuthRequest, res) => {
   res.json({ conversation: conv });
 });
 
+router.delete('/conversations/:id', authenticate, (req: AuthRequest, res) => {
+  const convId = req.params.id;
+  AetherSocketServer.instance?.broadcastToConversation(
+    convId,
+    {
+      type: 'conversation:deleted',
+      conversationId: convId,
+      deletedBy: req.user!.id,
+    },
+    req.user!.id
+  );
+  db.deleteConversation(convId);
+  res.json({ success: true, conversationId: convId });
+});
+
+router.delete('/conversations/:id/messages', authenticate, (req: AuthRequest, res) => {
+  const convId = req.params.id;
+  db.clearConversationMessages(convId);
+  AetherSocketServer.instance?.broadcastToConversation(
+    convId,
+    {
+      type: 'conversation:cleared',
+      conversationId: convId,
+      clearedBy: req.user!.id,
+    },
+    req.user!.id
+  );
+  res.json({ success: true, conversationId: convId });
+});
+
 router.get('/conversations/:id/messages', authenticate, (req: AuthRequest, res) => {
   const messages = db.getMessages(req.params.id);
   res.json({ messages });
 });
 
 router.post('/conversations/:id/messages', authenticate, (req: AuthRequest, res) => {
-  const { content, type, replyToId, mediaUrl, fileName, fileSize, mimeType, duration, voiceDuration, poll, location, contactCard, transcription } = req.body;
+  const {
+    id: clientMsgId,
+    content,
+    type,
+    replyToId,
+    mediaUrl,
+    fileName,
+    fileSize,
+    mimeType,
+    duration,
+    voiceDuration,
+    poll,
+    location,
+    contactCard,
+    transcription,
+    conversationMeta,
+  } = req.body;
+
+  // Ensure the conversation and all its participant records exist on this server instance before creating/broadcasting the message
+  db.ensureConversationExists(req.params.id, req.user!.id, conversationMeta);
 
   const created = db.createMessage({
+    ...(clientMsgId ? { id: String(clientMsgId) } : {}),
     conversationId: req.params.id,
     senderId: req.user!.id,
     type: (type as MessageType) || 'text',

@@ -98,7 +98,12 @@ export const NewConversationModal: React.FC<NewConversationModalProps> = ({
     return true;
   });
 
-  const filteredUsers = validOtherUsers.filter(u => {
+  const directoryUsers: User[] = [
+    ...validOtherUsers,
+    ...(currentUser ? [currentUser] : []),
+  ];
+
+  const filteredUsers = directoryUsers.filter(u => {
     if (!search.trim()) return true;
     const q = search.trim().toLowerCase().replace(/^@/, '');
     return (
@@ -378,29 +383,39 @@ export const NewConversationModal: React.FC<NewConversationModalProps> = ({
                   )}
                 </div>
               ) : (
-                filteredUsers.map(user => (
-                  <div
-                    key={user.id}
-                    onClick={() => toggleUserSelection(user.id)}
-                    className="flex items-center justify-between p-2.5 rounded-2xl hover:bg-white/5 border border-transparent hover:border-white/10 cursor-pointer transition"
-                  >
-                    <div className="flex items-center gap-3 min-w-0">
-                      <Avatar name={user.displayName} src={user.avatarUrl} isOnline={user.isOnline} size="md" />
-                      <div className="min-w-0">
-                        <div className="text-xs font-semibold text-white truncate">{user.displayName}</div>
-                        <div className="text-[10px] text-neutral-400 truncate">
-                          @{user.username}
-                          {user.email && !user.email.endsWith('@aether.chat') && !user.email.endsWith('@aether.local')
-                            ? ` • ${user.email}`
-                            : ''}
+                filteredUsers.map(user => {
+                  const isSelf = isSelfUser(user);
+                  return (
+                    <div
+                      key={user.id}
+                      onClick={() => toggleUserSelection(user.id)}
+                      className="flex items-center justify-between p-2.5 rounded-2xl hover:bg-white/5 border border-transparent hover:border-white/10 cursor-pointer transition"
+                    >
+                      <div className="flex items-center gap-3 min-w-0">
+                        <Avatar name={user.displayName} src={user.avatarUrl} isOnline={user.isOnline ?? true} size="md" />
+                        <div className="min-w-0">
+                          <div className="text-xs font-semibold text-white truncate flex items-center gap-1.5">
+                            <span className="truncate">{user.displayName}</span>
+                            {isSelf && (
+                              <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-white/10 text-neutral-300 shrink-0">
+                                You
+                              </span>
+                            )}
+                          </div>
+                          <div className="text-[10px] text-neutral-400 truncate">
+                            @{user.username}
+                            {user.email && !user.email.endsWith('@aether.chat') && !user.email.endsWith('@aether.local')
+                              ? ` • ${user.email}`
+                              : ''}
+                          </div>
                         </div>
                       </div>
+                      <button className="px-3 py-1.5 rounded-xl bg-white text-black text-xs font-bold hover:bg-neutral-200 transition cursor-pointer shrink-0">
+                        {isSelf ? 'Saved Chat' : 'Chat'}
+                      </button>
                     </div>
-                    <button className="px-3 py-1.5 rounded-xl bg-white text-black text-xs font-bold hover:bg-neutral-200 transition cursor-pointer shrink-0">
-                      Chat
-                    </button>
-                  </div>
-                ))
+                  );
+                })
               )}
             </div>
           </div>

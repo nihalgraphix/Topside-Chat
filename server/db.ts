@@ -91,25 +91,8 @@ class AetherDatabase {
   }
 
   public async publishUserToCloud(user: User): Promise<void> {
-    if (!user || !user.id) return;
+    if (!user || (!user.id && !user.username)) return;
     try {
-      const rawKey = (user.username || user.email?.split('@')[0] || user.id || 'member')
-        .toLowerCase()
-        .replace(/[^a-z0-9]/g, '')
-        .slice(0, 24) || 'member';
-      const syncEmail = `mesh_${rawKey}@aetherchat.app`;
-      const syncPass = `AetherMesh#2026#${rawKey}`;
-
-      let uid: string | undefined;
-      try {
-        const cred = await signInWithEmailAndPassword(serverAuth, syncEmail, syncPass);
-        uid = cred.user.uid;
-      } catch {
-        const created = await createUserWithEmailAndPassword(serverAuth, syncEmail, syncPass);
-        uid = created.user.uid;
-      }
-      if (!uid) return;
-
       let cleanUsername = (user.username || user.displayName || 'user')
         .trim()
         .toLowerCase()
@@ -117,21 +100,23 @@ class AetherDatabase {
         .replace(/[^a-z0-9_]/g, '_')
         .slice(0, 32);
       if (cleanUsername.length < 2) cleanUsername = `user_${cleanUsername || '1'}`;
+      if (cleanUsername === 'directory_reader' || cleanUsername === 'guest_viewer') return;
 
+      const docId = cleanUsername;
       const cleanDisplayName = (user.displayName || cleanUsername).trim().slice(0, 64) || 'User';
-      const cleanAppUserId = (user.id || uid).replace(/[^a-zA-Z0-9_\-]/g, '_').slice(0, 128);
+      const cleanAppUserId = (user.id || docId).replace(/[^a-zA-Z0-9_\-]/g, '_').slice(0, 128);
       const cleanAvatarUrl = (
         user.avatarUrl ||
         `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(cleanDisplayName)}`
-      ).slice(0, 1024);
+      ).slice(0, 2048);
       const cleanBio = (user.bio || 'Member of the encrypted communications mesh.').slice(0, 256);
 
-      const userRef = doc(serverFirestore, 'users', uid);
+      const userRef = doc(serverFirestore, 'users', docId);
       const snap = await getDoc(userRef);
 
       if (!snap.exists()) {
         await setDoc(userRef, {
-          uid,
+          uid: docId,
           appUserId: cleanAppUserId,
           username: cleanUsername,
           displayName: cleanDisplayName,
@@ -159,23 +144,12 @@ class AetherDatabase {
 
   public async pullUsersFromCloud(force = false): Promise<User[]> {
     const now = Date.now();
-    if (this.isCloudSyncing || (!force && now - this.lastCloudPullAt < 4000)) {
+    if (this.isCloudSyncing || (!force && now - this.lastCloudPullAt < 3000)) {
       return this.getUsers();
     }
     this.isCloudSyncing = true;
     this.lastCloudPullAt = now;
     try {
-      if (!serverAuth.currentUser) {
-        const syncEmail = 'mesh_directory_reader@aetherchat.app';
-        const syncPass = 'AetherMesh#2026#directory_reader';
-        try {
-          await signInWithEmailAndPassword(serverAuth, syncEmail, syncPass);
-        } catch {
-          await createUserWithEmailAndPassword(serverAuth, syncEmail, syncPass);
-        }
-      }
-      if (!serverAuth.currentUser) return this.getUsers();
-
       const q = query(
         collection(serverFirestore, 'users'),
         where('isOnline', 'in', [true, false]),
@@ -465,10 +439,29 @@ class AetherDatabase {
   }
 
   public getUserById(id: string): User | undefined {
-    const user = this.data.users.find(u => u.id === id);
+    if (!id) return undefined;
+    const user = this.data.users.find(u => u.id === id) || this.getUserByUsername(id);
     if (!user) return undefined;
     const { passwordHash, ...safeUser } = user;
     return safeUser;
+  }
+
+  public isSameUser(idOrNameA?: string, idOrNameB?: string): boolean {
+    if (!idOrNameA || !idOrNameB) return false;
+    if (idOrNameA === idOrNameB) return true;
+    const cleanA = idOrNameA.trim().toLowerCase().replace(/^@/, '');
+    const cleanB = idOrNameB.trim().toLowerCase().replace(/^@/, '');
+    if (cleanA === cleanB) return true;
+
+    const uA = this.getUserById(idOrNameA);
+    const uB = this.getUserById(idOrNameB);
+    if (uA && uB) {
+      if (uA.id === uB.id) return true;
+      if (uA.username.toLowerCase() === uB.username.toLowerCase()) return true;
+    }
+    if (uA && (uA.id === idOrNameB || uA.username.toLowerCase() === cleanB)) return true;
+    if (uB && (uB.id === idOrNameA || uB.username.toLowerCase() === cleanA)) return true;
+    return false;
   }
 
   public getUserByUsername(username: string): (User & { passwordHash: string }) | undefined {
@@ -539,7 +532,7 @@ class AetherDatabase {
   }
 
   public setUserOnline(userId: string, isOnline: boolean): void {
-    const user = this.data.users.find(u => u.id === userId);
+    const user = this.data.users.find(u => this.isSameUser(u.id, userId));
     if (user) {
       user.isOnline = isOnline;
       user.onlineStatus = isOnline ? 'online' : 'offline';
@@ -550,32 +543,78 @@ class AetherDatabase {
 
   // --- Conversations API ---
   public getUserConversations(userId: string): Conversation[] {
-    const memberRecords = this.data.conversationMembers.filter(cm => cm.userId === userId);
-    const convIds = memberRecords.map(cm => cm.conversationId);
+    const selfUser = this.getUserById(userId);
+    const selfUsername = selfUser?.username?.toLowerCase();
+
+    // Also auto-link any c_dm_<u1>__<u2> conversation where this user is one of the participants
+    if (selfUsername) {
+      for (const c of this.data.conversations) {
+        if (c.id.startsWith('c_dm_')) {
+          const parts = c.id.slice('c_dm_'.length).split('__');
+          if (parts.includes(selfUsername)) {
+            const hasMem = this.data.conversationMembers.some(
+              cm => cm.conversationId === c.id && this.isSameUser(cm.userId, userId)
+            );
+            if (!hasMem) {
+              this.data.conversationMembers.push({
+                id: `cm_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`,
+                conversationId: c.id,
+                userId,
+                role: 'member',
+                permissions: {
+                  canSendMessages: true,
+                  canAddMembers: true,
+                  canPinMessages: true,
+                  canDeleteMessages: true,
+                  canManageCalls: true,
+                },
+                joinedAt: c.createdAt,
+              });
+            }
+          }
+        }
+      }
+    }
+
+    const memberRecords = this.data.conversationMembers.filter(cm =>
+      this.isSameUser(cm.userId, userId)
+    );
+    const convIds = Array.from(new Set(memberRecords.map(cm => cm.conversationId)));
 
     const convs = this.data.conversations
       .filter(c => c.type !== 'channel' && convIds.includes(c.id))
       .map(c => {
         const mem = memberRecords.find(m => m.conversationId === c.id);
-        const allMembers = this.data.conversationMembers
-          .filter(m => m.conversationId === c.id)
-          .map(m => ({
+        const rawMembers = this.data.conversationMembers.filter(m => m.conversationId === c.id);
+        const seenUserKeys = new Set<string>();
+        const allMembers: ConversationMember[] = [];
+
+        for (const m of rawMembers) {
+          const resolvedUser = this.getUserById(m.userId);
+          const key = resolvedUser?.username?.toLowerCase() || resolvedUser?.id || m.userId;
+          if (seenUserKeys.has(key)) continue;
+          seenUserKeys.add(key);
+          allMembers.push({
             ...m,
-            user: this.getUserById(m.userId),
-          }));
+            userId: resolvedUser?.id || m.userId,
+            user: resolvedUser,
+          });
+        }
 
         // Fetch last message
         const messages = this.data.messages.filter(m => m.conversationId === c.id);
         const lastMessage = messages.length > 0 ? messages[messages.length - 1] : undefined;
 
         // Count unread
-        const unreadCount = messages.filter(m => m.senderId !== userId && m.status !== 'read').length;
+        const unreadCount = messages.filter(
+          m => !this.isSameUser(m.senderId, userId) && m.status !== 'read'
+        ).length;
 
-        // For direct chats, dynamically set name and avatar to other participant if not set
+        // For direct chats, dynamically set name and avatar to other participant
         let name = c.name;
         let avatarUrl = c.avatarUrl;
         if (c.type === 'direct') {
-          const otherMember = allMembers.find(m => m.userId !== userId);
+          const otherMember = allMembers.find(m => !this.isSameUser(m.userId, userId));
           if (otherMember && otherMember.user) {
             name = otherMember.user.displayName;
             avatarUrl = otherMember.user.avatarUrl;
@@ -608,12 +647,21 @@ class AetherDatabase {
     const c = this.data.conversations.find(conv => conv.id === convId);
     if (!c) return undefined;
 
-    const allMembers = this.data.conversationMembers
-      .filter(m => m.conversationId === c.id)
-      .map(m => ({
+    const rawMembers = this.data.conversationMembers.filter(m => m.conversationId === c.id);
+    const seenUserKeys = new Set<string>();
+    const allMembers: ConversationMember[] = [];
+
+    for (const m of rawMembers) {
+      const resolvedUser = this.getUserById(m.userId);
+      const key = resolvedUser?.username?.toLowerCase() || resolvedUser?.id || m.userId;
+      if (seenUserKeys.has(key)) continue;
+      seenUserKeys.add(key);
+      allMembers.push({
         ...m,
-        user: this.getUserById(m.userId),
-      }));
+        userId: resolvedUser?.id || m.userId,
+        user: resolvedUser,
+      });
+    }
 
     const messages = this.data.messages.filter(m => m.conversationId === c.id);
     const lastMessage = messages.length > 0 ? messages[messages.length - 1] : undefined;
@@ -621,14 +669,18 @@ class AetherDatabase {
     let name = c.name;
     let avatarUrl = c.avatarUrl;
     if (c.type === 'direct' && currentUserId) {
-      const otherMember = allMembers.find(m => m.userId !== currentUserId);
+      const otherMember = allMembers.find(m => !this.isSameUser(m.userId, currentUserId));
       if (otherMember && otherMember.user) {
         name = otherMember.user.displayName;
         avatarUrl = otherMember.user.avatarUrl;
       }
     }
 
-    const mem = currentUserId ? this.data.conversationMembers.find(m => m.conversationId === c.id && m.userId === currentUserId) : undefined;
+    const mem = currentUserId
+      ? this.data.conversationMembers.find(
+          m => m.conversationId === c.id && this.isSameUser(m.userId, currentUserId)
+        )
+      : undefined;
 
     return {
       ...c,
@@ -642,9 +694,100 @@ class AetherDatabase {
     };
   }
 
+  public ensureConversationExists(
+    convId: string,
+    senderId: string,
+    meta?: {
+      type?: 'direct' | 'group' | 'channel' | 'saved';
+      name?: string;
+      description?: string;
+      avatarUrl?: string;
+      memberIds?: string[];
+      memberUsers?: Partial<User>[];
+    }
+  ): Conversation {
+    if (Array.isArray(meta?.memberUsers) && meta!.memberUsers.length > 0) {
+      this.upsertExternalUsers(meta!.memberUsers, false);
+    }
+
+    const dmParts = convId.startsWith('c_dm_')
+      ? convId.slice('c_dm_'.length).split('__').filter(Boolean)
+      : [];
+
+    const allCandidateIds = Array.from(
+      new Set([
+        senderId,
+        ...(meta?.memberIds || []),
+        ...dmParts,
+      ])
+    ).filter(Boolean);
+
+    let conv = this.data.conversations.find(c => c.id === convId);
+    const now = new Date().toISOString();
+
+    if (!conv) {
+      const convType = meta?.type || 'direct';
+      const convName = meta?.name || 'Direct Chat';
+      conv = {
+        id: convId,
+        type: convType,
+        name: convName,
+        description: meta?.description,
+        avatarUrl:
+          meta?.avatarUrl ||
+          `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(convName)}`,
+        isPrivate: true,
+        isEncrypted: convType !== 'channel',
+        createdAt: now,
+        createdBy: senderId,
+        members: [],
+      };
+      this.data.conversations.push(conv);
+      try {
+        sqlStorage.saveConversation(conv);
+      } catch {
+        // Ignore
+      }
+    }
+
+    let membersChanged = false;
+    for (const candidate of allCandidateIds) {
+      const resolvedUser = this.getUserById(candidate);
+      const canonicalUserId = resolvedUser?.id || candidate;
+      const alreadyMember = this.data.conversationMembers.some(
+        m => m.conversationId === convId && this.isSameUser(m.userId, canonicalUserId)
+      );
+      if (!alreadyMember) {
+        const mem: ConversationMember = {
+          id: `cm_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`,
+          conversationId: convId,
+          userId: canonicalUserId,
+          role: this.isSameUser(canonicalUserId, senderId) ? 'owner' : 'member',
+          permissions: {
+            canSendMessages: true,
+            canAddMembers: true,
+            canPinMessages: true,
+            canDeleteMessages: true,
+            canManageCalls: true,
+          },
+          joinedAt: now,
+        };
+        this.data.conversationMembers.push(mem);
+        membersChanged = true;
+      }
+    }
+
+    if (membersChanged) {
+      this.queueSave();
+    }
+
+    return this.getConversationById(convId, senderId)!;
+  }
+
   public createConversation(
     creatorId: string,
     data: {
+      id?: string;
       type: 'direct' | 'group' | 'channel' | 'saved';
       name: string;
       description?: string;
@@ -654,7 +797,39 @@ class AetherDatabase {
       memberIds?: string[];
     }
   ): Conversation {
-    const convId = `c_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
+    const creatorUser = this.getUserById(creatorId);
+    const otherRawId = data.memberIds?.[0];
+    const otherUser = otherRawId ? this.getUserById(otherRawId) : undefined;
+
+    let convId = data.id;
+    if (!convId) {
+      if (data.type === 'direct' && (otherUser || otherRawId)) {
+        const keyA = (creatorUser?.username || creatorId)
+          .trim()
+          .toLowerCase()
+          .replace(/[^a-z0-9_]/g, '_');
+        const keyB = (otherUser?.username || otherRawId || 'peer')
+          .trim()
+          .toLowerCase()
+          .replace(/[^a-z0-9_]/g, '_');
+        const sorted = [keyA, keyB].sort();
+        convId = `c_dm_${sorted[0]}__${sorted[1]}`;
+      } else {
+        convId = `c_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
+      }
+    }
+
+    const existingById = this.data.conversations.find(c => c.id === convId);
+    if (existingById) {
+      return this.ensureConversationExists(convId, creatorId, {
+        type: data.type,
+        name: data.name,
+        description: data.description,
+        avatarUrl: data.avatarUrl,
+        memberIds: data.memberIds,
+      });
+    }
+
     const now = new Date().toISOString();
 
     const newConv: Conversation = {
@@ -685,11 +860,13 @@ class AetherDatabase {
 
     if (data.memberIds) {
       data.memberIds.forEach(mId => {
-        if (mId !== creatorId) {
+        const resolvedMember = this.getUserById(mId);
+        const targetMemberId = resolvedMember?.id || mId;
+        if (!this.isSameUser(targetMemberId, creatorId)) {
           this.data.conversationMembers.push({
             id: `cm_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`,
             conversationId: convId,
-            userId: mId,
+            userId: targetMemberId,
             role: 'member',
             permissions: {
               canSendMessages: data.type !== 'channel',
@@ -771,6 +948,33 @@ class AetherDatabase {
 
     this.queueSave();
     return true;
+  }
+
+  public clearConversationMessages(conversationId: string): boolean {
+    this.data.messages = this.data.messages.filter(m => m.conversationId !== conversationId);
+    this.queueSave();
+    try {
+      sqlStorage.clearConversationMessages(conversationId);
+    } catch (err) {
+      console.error('Failed to clear conversation messages in SQLite', err);
+    }
+    return true;
+  }
+
+  public deleteConversation(conversationId: string): boolean {
+    const existed = this.data.conversations.some(c => c.id === conversationId);
+    this.data.conversations = this.data.conversations.filter(c => c.id !== conversationId);
+    this.data.conversationMembers = this.data.conversationMembers.filter(
+      m => m.conversationId !== conversationId
+    );
+    this.data.messages = this.data.messages.filter(m => m.conversationId !== conversationId);
+    this.queueSave();
+    try {
+      sqlStorage.deleteConversation(conversationId);
+    } catch (err) {
+      console.error('Failed to delete conversation in SQLite', err);
+    }
+    return existed || true;
   }
 
   // --- Messages API ---

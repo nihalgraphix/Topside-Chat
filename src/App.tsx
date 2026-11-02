@@ -21,6 +21,10 @@ import { StoryEditorModal } from './components/stories/StoryEditorModal';
 import { StoryViewerModal } from './components/stories/StoryViewerModal';
 import { useSocket } from './lib/useSocket';
 import { api } from './lib/api';
+import {
+  subscribeToConversationsFromFirestore,
+  subscribeToMessagesFromFirestore,
+} from './lib/firebase';
 import { User, Conversation, Message, Story, Call, AccentTheme } from './types';
 import { Sparkles, MessageSquare, Shield, Bell } from 'lucide-react';
 
@@ -102,40 +106,144 @@ export default function App() {
     setToasts(prev => prev.filter(t => t.id !== id));
   }, []);
 
+  const conversationsRef = useRef<Conversation[]>([]);
+  conversationsRef.current = conversations;
+
+  const isSameUserIdentity = useCallback((uA?: Partial<User> | string | null, uB?: Partial<User> | string | null): boolean => {
+    if (!uA || !uB) return false;
+    const idA = typeof uA === 'string' ? uA : uA.id || '';
+    const idB = typeof uB === 'string' ? uB : uB.id || '';
+    if (idA && idB && idA === idB) return true;
+    const nameA = (typeof uA === 'string' ? uA : uA.username || '').trim().toLowerCase().replace(/^@/, '');
+    const nameB = (typeof uB === 'string' ? uB : uB.username || '').trim().toLowerCase().replace(/^@/, '');
+    return Boolean(nameA && nameB && nameA === nameB);
+  }, []);
+
   // WebSocket Event Handlers
   const socketHandlers = {
     onNewMessage: (msg: Message) => {
-      // If message is for active conversation, append with deduplication
-      if (activeConversationIdRef.current === msg.conversationId) {
+      if (!msg || !msg.id) return;
+      api.unmarkConvDeleted(msg.conversationId);
+
+      const self = currentUserRef.current;
+      const isFromSelf = isSameUserIdentity(
+        msg.sender || msg.senderId,
+        self
+      );
+
+      const activeId = activeConversationIdRef.current;
+      const activeConv = conversationsRef.current.find(c => c.id === activeId);
+      const isDirectPartnerMatch =
+        activeConv?.type === 'direct' &&
+        activeConv.members.some(m =>
+          isSameUserIdentity(m.user || m.userId, msg.sender || msg.senderId)
+        );
+
+      // If message is for active conversation (or open direct chat with the same sender), append with deduplication
+      if (activeId === msg.conversationId || isDirectPartnerMatch) {
         setMessages(prev => dedupeMessages([...prev, msg]));
-        // If recipient has active conversation open, immediately mark as read & send receipt
-        if (msg.senderId !== currentUserRef.current?.id) {
+        if (!isFromSelf) {
           api.markAsRead(msg.conversationId);
           sendReadReceiptRef.current?.(msg.conversationId);
         }
       }
 
-      // Update conversations preview
-      setConversations(prev =>
-        prev.map(c => {
-          if (c.id === msg.conversationId) {
-            const isCurrentActive = activeConversationIdRef.current === c.id;
-            return {
-              ...c,
-              lastMessage: msg,
-              unreadCount: isCurrentActive ? 0 : (c.unreadCount || 0) + 1,
-            };
+      // Update conversations preview, or create the conversation entry immediately if new
+      setConversations(prev => {
+        const exists = prev.some(c => c.id === msg.conversationId);
+        let nextList: Conversation[];
+
+        if (exists) {
+          nextList = prev.map(c => {
+            if (c.id === msg.conversationId) {
+              const isCurrentActive = activeConversationIdRef.current === c.id;
+              return {
+                ...c,
+                lastMessage: msg,
+                unreadCount: isCurrentActive || isFromSelf ? 0 : (c.unreadCount || 0) + 1,
+              };
+            }
+            return c;
+          });
+        } else {
+          const senderName = msg.sender?.displayName || msg.sender?.username || 'New Chat';
+          const senderAvatar =
+            msg.sender?.avatarUrl ||
+            `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(senderName)}`;
+          const newConv: Conversation = {
+            id: msg.conversationId,
+            type: 'direct',
+            name: senderName,
+            avatarUrl: senderAvatar,
+            isPrivate: true,
+            isEncrypted: true,
+            createdAt: msg.createdAt || new Date().toISOString(),
+            createdBy: msg.senderId,
+            lastMessage: msg,
+            unreadCount: isFromSelf ? 0 : 1,
+            members: [
+              ...(self
+                ? [
+                    {
+                      id: `cm_self_${Date.now()}`,
+                      conversationId: msg.conversationId,
+                      userId: self.id,
+                      user: self,
+                      role: 'member' as const,
+                      permissions: {
+                        canSendMessages: true,
+                        canAddMembers: true,
+                        canPinMessages: true,
+                        canDeleteMessages: true,
+                        canManageCalls: true,
+                      },
+                      joinedAt: new Date().toISOString(),
+                    },
+                  ]
+                : []),
+              ...(msg.sender
+                ? [
+                    {
+                      id: `cm_sender_${Date.now()}`,
+                      conversationId: msg.conversationId,
+                      userId: msg.sender.id || msg.senderId,
+                      user: msg.sender,
+                      role: 'owner' as const,
+                      permissions: {
+                        canSendMessages: true,
+                        canAddMembers: true,
+                        canPinMessages: true,
+                        canDeleteMessages: true,
+                        canManageCalls: true,
+                      },
+                      joinedAt: new Date().toISOString(),
+                    },
+                  ]
+                : []),
+            ],
+          };
+          nextList = [newConv, ...prev];
+          if (!activeConversationIdRef.current) {
+            setActiveConversationId(msg.conversationId);
+            setMessages(prevMsgs => dedupeMessages([...prevMsgs, msg]));
           }
-          return c;
-        })
-      );
+        }
+
+        return nextList.sort((a, b) => {
+          if (a.isPinned && !b.isPinned) return -1;
+          if (!a.isPinned && b.isPinned) return 1;
+          const timeA = a.lastMessage?.createdAt || a.createdAt;
+          const timeB = b.lastMessage?.createdAt || b.createdAt;
+          return new Date(timeB).getTime() - new Date(timeA).getTime();
+        });
+      });
 
       // Toast notification if sender is someone else
-      if (msg.senderId !== currentUser?.id) {
+      if (!isFromSelf) {
         addToast({
           type: 'info',
           title: msg.sender?.displayName || 'New Message',
-          message: msg.content.length > 50 ? `${msg.content.slice(0, 50)}...` : msg.content,
+          message: msg.content.length > 50 ? `${msg.content.slice(0, 50)}...` : msg.content || 'Sent an attachment',
         });
       }
     },
@@ -273,6 +381,75 @@ export default function App() {
     [sendReadReceipt]
   );
 
+  const handleDeleteConversation = useCallback(
+    async (convId: string) => {
+      try {
+        await api.deleteConversation(convId);
+        setConversations(prev => {
+          const remaining = prev.filter(c => c.id !== convId);
+          if (activeConversationIdRef.current === convId) {
+            setActiveConversationId(remaining.length > 0 ? remaining[0].id : null);
+            setMessages([]);
+            setShowInfoPanel(false);
+          }
+          return remaining;
+        });
+        addToast({ type: 'success', message: 'Conversation deleted.' });
+      } catch (err) {
+        console.error('Failed to delete conversation', err);
+        addToast({ type: 'error', message: 'Could not delete conversation.' });
+      }
+    },
+    [addToast]
+  );
+
+  const handleClearConversationMessages = useCallback(
+    async (convId: string) => {
+      try {
+        await api.clearConversationMessages(convId);
+        if (activeConversationIdRef.current === convId) {
+          setMessages([]);
+        }
+        setConversations(prev =>
+          prev.map(c => (c.id === convId ? { ...c, lastMessage: undefined, unreadCount: 0 } : c))
+        );
+        addToast({ type: 'success', message: 'Chat messages cleared.' });
+      } catch (err) {
+        console.error('Failed to clear conversation messages', err);
+      }
+    },
+    [addToast]
+  );
+
+  const handleDeleteAllConversations = useCallback(async () => {
+    const ids = conversations.map(c => c.id);
+    setConversations([]);
+    setActiveConversationId(null);
+    setMessages([]);
+    setShowInfoPanel(false);
+    await Promise.all(ids.map(id => api.deleteConversation(id).catch(() => {})));
+    addToast({ type: 'success', message: 'All conversations deleted.' });
+  }, [conversations, addToast]);
+
+  const handleClearAllConversations = useCallback(async () => {
+    const ids = conversations.map(c => c.id);
+    setMessages([]);
+    setConversations(prev => prev.map(c => ({ ...c, lastMessage: undefined, unreadCount: 0 })));
+    await Promise.all(ids.map(id => api.clearConversationMessages(id).catch(() => {})));
+    addToast({ type: 'success', message: 'All chat histories cleared.' });
+  }, [conversations, addToast]);
+
+  const handleTogglePinConversation = useCallback(async (convId: string) => {
+    try {
+      const res = await api.togglePinConversation(convId);
+      setConversations(prev =>
+        prev.map(c => (c.id === convId ? { ...c, isPinned: res.isPinned } : c))
+      );
+    } catch (err) {
+      console.error('Failed to toggle pin conversation', err);
+    }
+  }, []);
+
   // Initial user initialization: check persistent session
   useEffect(() => {
     const handleUnauthorized = () => {
@@ -371,6 +548,131 @@ export default function App() {
 
     fetchMsgs();
   }, [activeConversationId, sendReadReceipt, dedupeMessages]);
+
+  // Real-time Firestore onSnapshot listeners + fast background sync for instant cross-instance delivery
+  useEffect(() => {
+    if (!currentUser) return;
+
+    const unsubConvs = subscribeToConversationsFromFirestore(
+      currentUser,
+      contactsList,
+      cloudConvs => {
+        if (!cloudConvs || cloudConvs.length === 0) return;
+        setConversations(prev => {
+          const map = new Map<string, Conversation>();
+          for (const c of prev) {
+            if (c && c.id) map.set(c.id, c);
+          }
+          for (const cc of cloudConvs) {
+            if (!cc || !cc.id || cc.type === 'channel') continue;
+            const existing = map.get(cc.id);
+            let bestLastMsg = cc.lastMessage || existing?.lastMessage;
+            if (cc.lastMessage && existing?.lastMessage) {
+              const isCCPreview = cc.lastMessage.id.startsWith('m_preview_');
+              const isExPreview = existing.lastMessage.id.startsWith('m_preview_');
+              if (isCCPreview && !isExPreview) {
+                const timeCC = new Date(cc.lastMessage.createdAt).getTime();
+                const timeEx = new Date(existing.lastMessage.createdAt).getTime();
+                bestLastMsg = timeCC > timeEx + 1000 ? cc.lastMessage : existing.lastMessage;
+              } else if (!isCCPreview && isExPreview) {
+                bestLastMsg = cc.lastMessage;
+              } else {
+                const timeCC = new Date(cc.lastMessage.createdAt).getTime();
+                const timeEx = new Date(existing.lastMessage.createdAt).getTime();
+                bestLastMsg = timeCC >= timeEx ? cc.lastMessage : existing.lastMessage;
+              }
+            }
+            map.set(cc.id, {
+              ...(existing || {}),
+              ...cc,
+              name:
+                existing?.name && existing.name !== 'Chat' && existing.name !== 'Direct Chat'
+                  ? existing.name
+                  : cc.name,
+              avatarUrl: existing?.avatarUrl || cc.avatarUrl,
+              members: cc.members?.length ? cc.members : existing?.members || [],
+              lastMessage: bestLastMsg,
+            });
+          }
+          const merged = Array.from(map.values()).sort((a, b) => {
+            if (a.isPinned && !b.isPinned) return -1;
+            if (!a.isPinned && b.isPinned) return 1;
+            const timeA = a.lastMessage?.createdAt || a.createdAt;
+            const timeB = b.lastMessage?.createdAt || b.createdAt;
+            return new Date(timeB).getTime() - new Date(timeA).getTime();
+          });
+          if (merged.length > 0 && !activeConversationIdRef.current) {
+            setActiveConversationId(merged[0].id);
+          }
+          return merged;
+        });
+      }
+    );
+
+    return () => {
+      unsubConvs();
+    };
+  }, [currentUser, contactsList]);
+
+  useEffect(() => {
+    if (!currentUser || !activeConversationId) return;
+    const activeConv = conversationsRef.current.find(c => c.id === activeConversationId);
+
+    const unsubMsgs = subscribeToMessagesFromFirestore(
+      activeConversationId,
+      currentUser,
+      contactsList,
+      activeConv,
+      cloudMsgs => {
+        if (!cloudMsgs || cloudMsgs.length === 0) return;
+        setMessages(prev => {
+          const merged = dedupeMessages([...prev, ...cloudMsgs]);
+          merged.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+          return merged;
+        });
+      }
+    );
+
+    return () => {
+      unsubMsgs();
+    };
+  }, [currentUser, activeConversationId, contactsList, dedupeMessages]);
+
+  // Fast 2.5s sync fallback for messages & conversations across servers
+  useEffect(() => {
+    if (!currentUser) return;
+    let isMounted = true;
+
+    const syncLiveChat = async () => {
+      try {
+        const convs = await api.getConversations();
+        if (!isMounted) return;
+        const nonChannel = convs.filter(c => c.type !== 'channel');
+        setConversations(nonChannel);
+
+        const activeId = activeConversationIdRef.current;
+        if (activeId) {
+          const latestMsgs = await api.getMessages(activeId);
+          if (!isMounted) return;
+          setMessages(prev => {
+            const merged = dedupeMessages([...prev, ...latestMsgs]);
+            merged.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+            return merged;
+          });
+        } else if (nonChannel.length > 0) {
+          setActiveConversationId(nonChannel[0].id);
+        }
+      } catch {
+        // Ignore transient poll error
+      }
+    };
+
+    const interval = setInterval(syncLiveChat, 2500);
+    return () => {
+      isMounted = false;
+      clearInterval(interval);
+    };
+  }, [currentUser, dedupeMessages]);
 
   // Actions
   const handleSendMessage = async (data: any) => {
@@ -797,6 +1099,7 @@ export default function App() {
               currentUser={currentUser}
               theme={theme}
               accent={accent}
+              conversations={conversations}
               onUpdateUser={updated => setCurrentUser(updated)}
               onUpdateTheme={(newTheme, newAccent) => {
                 setTheme(newTheme);
@@ -808,6 +1111,10 @@ export default function App() {
                 setNewConvType(type || 'direct');
                 setIsNewConvOpen(true);
               }}
+              onDeleteConversation={handleDeleteConversation}
+              onClearConversation={handleClearConversationMessages}
+              onDeleteAllConversations={handleDeleteAllConversations}
+              onClearAllConversations={handleClearAllConversations}
               onLogout={handleLogout}
             />
           ) : (
@@ -835,6 +1142,8 @@ export default function App() {
                   onSelectStory={setActiveStory}
                   onOpenCommandPalette={() => setIsCommandPaletteOpen(true)}
                   onOpenCallsHistory={() => setActiveMainTab('calls')}
+                  onDeleteConversation={handleDeleteConversation}
+                  onTogglePinConversation={handleTogglePinConversation}
                 />
               </div>
 
@@ -857,6 +1166,8 @@ export default function App() {
                   onUpdateMessages={handleUpdateMessages}
                   onSelectConversation={id => setActiveConversationId(id)}
                   onMarkAsRead={handleMarkAsRead}
+                  onDeleteConversation={handleDeleteConversation}
+                  onClearConversation={handleClearConversationMessages}
                 />
               ) : (
                 /* Empty Conversation Placeholder */
@@ -886,6 +1197,8 @@ export default function App() {
                     onStartCall={handleStartCall}
                     onSendMessage={handleSendMessage}
                     onImageClick={setViewingImageUrl}
+                    onDeleteConversation={handleDeleteConversation}
+                    onClearConversation={handleClearConversationMessages}
                   />
                 </div>
               )}
@@ -898,6 +1211,11 @@ export default function App() {
                   currentUser={currentUser}
                   onClose={() => setShowInfoPanel(false)}
                   onImageClick={setViewingImageUrl}
+                  onDeleteConversation={convId => {
+                    handleDeleteConversation(convId);
+                    setShowInfoPanel(false);
+                  }}
+                  onClearConversation={handleClearConversationMessages}
                   onBlockUser={() => {
                     addToast({ type: 'info', message: 'User blocked' });
                     setShowInfoPanel(false);

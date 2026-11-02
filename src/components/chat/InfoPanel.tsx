@@ -15,6 +15,7 @@ import {
   ChevronRight,
   ExternalLink,
   Download,
+  Trash2,
 } from 'lucide-react';
 import { Conversation, Message, User } from '../../types';
 import { Avatar } from '../common/Avatar';
@@ -28,6 +29,8 @@ interface InfoPanelProps {
   onImageClick: (url: string) => void;
   onBlockUser?: () => void;
   onReport?: () => void;
+  onDeleteConversation?: (conversationId: string) => void;
+  onClearConversation?: (conversationId: string) => void;
 }
 
 export const InfoPanel: React.FC<InfoPanelProps> = ({
@@ -38,10 +41,14 @@ export const InfoPanel: React.FC<InfoPanelProps> = ({
   onImageClick,
   onBlockUser,
   onReport,
+  onDeleteConversation,
+  onClearConversation,
 }) => {
   const [activeTab, setActiveTab] = useState<'media' | 'files' | 'links' | 'members'>('media');
   const [isMuted, setIsMuted] = useState(conversation.isMuted || false);
   const [disappearingTime, setDisappearingTime] = useState<string>('Off');
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [confirmClear, setConfirmClear] = useState(false);
 
   const uniqueMessages: Message[] = Array.from(
     new Map<string, Message>(
@@ -259,24 +266,92 @@ export const InfoPanel: React.FC<InfoPanelProps> = ({
       </div>
 
       {/* Bottom Danger Zone */}
-      {isDirect && (
-        <div className="p-4 border-t border-white/10 space-y-2">
-          <button
-            onClick={onBlockUser}
-            className="w-full py-2.5 px-4 rounded-xl bg-[#111111] border border-white/10 text-neutral-300 hover:text-white hover:bg-white/10 text-xs font-semibold flex items-center justify-center gap-2 transition"
-          >
-            <UserX className="w-4 h-4" />
-            <span>Block Contact</span>
-          </button>
-          <button
-            onClick={onReport}
-            className="w-full py-2.5 px-4 rounded-xl bg-[#111111] border border-white/10 text-neutral-400 hover:text-white hover:bg-white/10 text-xs font-medium flex items-center justify-center gap-2 transition"
-          >
-            <AlertTriangle className="w-4 h-4" />
-            <span>Report Conversation</span>
-          </button>
-        </div>
-      )}
+      <div className="p-4 border-t border-white/10 space-y-2">
+        {onClearConversation && (
+          confirmClear ? (
+            <div className="p-2.5 rounded-xl bg-[#111111] border border-white/20 flex items-center justify-between gap-2">
+              <span className="text-xs text-white font-semibold">Clear all messages?</span>
+              <div className="flex items-center gap-1.5">
+                <button
+                  onClick={() => {
+                    setConfirmClear(false);
+                    onClearConversation(conversation.id);
+                  }}
+                  className="px-3 py-1 rounded-lg bg-white text-black text-xs font-bold hover:bg-neutral-200 transition cursor-pointer"
+                >
+                  Clear
+                </button>
+                <button
+                  onClick={() => setConfirmClear(false)}
+                  className="px-2.5 py-1 rounded-lg bg-white/10 text-xs text-neutral-300 hover:text-white transition cursor-pointer"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          ) : (
+            <button
+              onClick={() => setConfirmClear(true)}
+              className="w-full py-2.5 px-4 rounded-xl bg-[#111111] border border-white/10 text-neutral-300 hover:text-white hover:bg-white/10 text-xs font-semibold flex items-center justify-center gap-2 transition cursor-pointer"
+            >
+              <Trash2 className="w-4 h-4" />
+              <span>Clear Chat History</span>
+            </button>
+          )
+        )}
+
+        {onDeleteConversation && (
+          confirmDelete ? (
+            <div className="p-2.5 rounded-xl bg-white/10 border border-white/30 flex items-center justify-between gap-2">
+              <span className="text-xs text-white font-bold">Delete this conversation?</span>
+              <div className="flex items-center gap-1.5">
+                <button
+                  onClick={() => {
+                    setConfirmDelete(false);
+                    onDeleteConversation(conversation.id);
+                  }}
+                  className="px-3 py-1 rounded-lg bg-white text-black text-xs font-bold hover:bg-neutral-200 transition cursor-pointer"
+                >
+                  Delete
+                </button>
+                <button
+                  onClick={() => setConfirmDelete(false)}
+                  className="px-2.5 py-1 rounded-lg bg-white/10 text-xs text-neutral-300 hover:text-white transition cursor-pointer"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          ) : (
+            <button
+              onClick={() => setConfirmDelete(true)}
+              className="w-full py-2.5 px-4 rounded-xl bg-white text-black hover:bg-neutral-200 text-xs font-bold flex items-center justify-center gap-2 transition cursor-pointer"
+            >
+              <Trash2 className="w-4 h-4" />
+              <span>Delete Conversation</span>
+            </button>
+          )
+        )}
+
+        {isDirect && (
+          <>
+            <button
+              onClick={onBlockUser}
+              className="w-full py-2.5 px-4 rounded-xl bg-[#111111] border border-white/10 text-neutral-300 hover:text-white hover:bg-white/10 text-xs font-semibold flex items-center justify-center gap-2 transition cursor-pointer"
+            >
+              <UserX className="w-4 h-4" />
+              <span>Block Contact</span>
+            </button>
+            <button
+              onClick={onReport}
+              className="w-full py-2.5 px-4 rounded-xl bg-[#111111] border border-white/10 text-neutral-400 hover:text-white hover:bg-white/10 text-xs font-medium flex items-center justify-center gap-2 transition cursor-pointer"
+            >
+              <AlertTriangle className="w-4 h-4" />
+              <span>Report Conversation</span>
+            </button>
+          </>
+        )}
+      </div>
     </div>
   );
 };

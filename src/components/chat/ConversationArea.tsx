@@ -62,6 +62,8 @@ interface ConversationAreaProps {
   onUpdateMessages?: (messages: Message[]) => void;
   onSelectConversation?: (id: string) => void;
   onMarkAsRead?: (conversationId: string) => void;
+  onDeleteConversation?: (conversationId: string) => void;
+  onClearConversation?: (conversationId: string) => void;
 }
 
 export const ConversationArea: React.FC<ConversationAreaProps> = ({
@@ -80,6 +82,8 @@ export const ConversationArea: React.FC<ConversationAreaProps> = ({
   onUpdateMessages,
   onSelectConversation,
   onMarkAsRead,
+  onDeleteConversation,
+  onClearConversation,
 }) => {
   const [inputText, setInputText] = useState('');
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
@@ -100,6 +104,7 @@ export const ConversationArea: React.FC<ConversationAreaProps> = ({
   const [copiedTranscriptId, setCopiedTranscriptId] = useState<string | null>(null);
   const [isTranscribingInput, setIsTranscribingInput] = useState<boolean>(false);
   const [voiceError, setVoiceError] = useState<string | null>(null);
+  const [showDeleteChatMenu, setShowDeleteChatMenu] = useState<boolean>(false);
 
   const slashCommands = [
     { cmd: '/help', desc: 'Display interactive bot commands & shortcuts' },
@@ -158,6 +163,7 @@ export const ConversationArea: React.FC<ConversationAreaProps> = ({
     setSearchQuery('');
     setContextMenu(null);
     setActiveReactionPickerMsgId(null);
+    setShowDeleteChatMenu(false);
   }, [conversation?.id]);
 
   // Close context menu and reaction popover on click outside, window scroll, or Escape key
@@ -1135,6 +1141,64 @@ export const ConversationArea: React.FC<ConversationAreaProps> = ({
                 <Video className="w-4 h-4" />
               </button>
 
+              {(onDeleteConversation || onClearConversation) && (
+                <div className="relative">
+                  <button
+                    onClick={() => setShowDeleteChatMenu(prev => !prev)}
+                    title="Clear or Delete Chat"
+                    className={`w-9 h-9 rounded-xl border flex items-center justify-center transition cursor-pointer active:scale-95 ${
+                      showDeleteChatMenu
+                        ? 'bg-white text-black border-white'
+                        : 'bg-[#111111] border-white/15 hover:border-white text-neutral-300 hover:text-white'
+                    }`}
+                  >
+                    <Trash2 className="w-4 h-4" />
+                  </button>
+
+                  {showDeleteChatMenu && (
+                    <div className="absolute right-0 top-11 w-56 rounded-2xl bg-[#0a0a0a] border border-white/25 p-2 shadow-2xl z-50 space-y-1">
+                      <div className="px-2.5 py-1.5 border-b border-white/10">
+                        <div className="text-[11px] font-bold text-white truncate">Manage {conversation.name}</div>
+                        <div className="text-[10px] text-neutral-400">Clear messages or delete chat</div>
+                      </div>
+
+                      {onClearConversation && (
+                        <button
+                          onClick={() => {
+                            setShowDeleteChatMenu(false);
+                            onClearConversation(conversation.id);
+                          }}
+                          className="w-full px-3 py-2 rounded-xl text-xs font-medium text-neutral-200 hover:bg-white/10 hover:text-white flex items-center justify-between transition cursor-pointer"
+                        >
+                          <span>Clear Chat History</span>
+                          <span className="text-[10px] font-mono text-neutral-400">{messages.length} msgs</span>
+                        </button>
+                      )}
+
+                      {onDeleteConversation && (
+                        <button
+                          onClick={() => {
+                            setShowDeleteChatMenu(false);
+                            onDeleteConversation(conversation.id);
+                          }}
+                          className="w-full px-3 py-2 rounded-xl text-xs font-bold bg-white text-black hover:bg-neutral-200 flex items-center justify-between transition cursor-pointer"
+                        >
+                          <span>Delete Conversation</span>
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      )}
+
+                      <button
+                        onClick={() => setShowDeleteChatMenu(false)}
+                        className="w-full px-3 py-1.5 rounded-xl text-[11px] text-neutral-400 hover:text-white text-center transition cursor-pointer"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+
               {onOpenSettings && (
                 <button
                   onClick={onOpenSettings}
@@ -1251,7 +1315,11 @@ export const ConversationArea: React.FC<ConversationAreaProps> = ({
 
         {/* Message stream */}
         {filteredMessages.map((msg, index) => {
-          const isMe = msg.senderId === currentUser.id;
+          const isMe =
+            msg.senderId === currentUser.id ||
+            (Boolean(currentUser.username) &&
+              (msg.senderId.toLowerCase() === currentUser.username.toLowerCase() ||
+                msg.sender?.username?.toLowerCase() === currentUser.username.toLowerCase()));
           const showDateHeader =
             index === 0 ||
             new Date(msg.createdAt).toDateString() !==

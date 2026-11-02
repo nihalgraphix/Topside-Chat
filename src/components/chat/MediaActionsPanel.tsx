@@ -12,6 +12,7 @@ import {
   Send,
   DollarSign,
   Check,
+  Trash2,
 } from 'lucide-react';
 import { Conversation, Message, User } from '../../types';
 
@@ -22,6 +23,8 @@ interface MediaActionsPanelProps {
   onStartCall: (type: 'voice' | 'video') => void;
   onSendMessage: (data: any) => void;
   onImageClick: (url: string) => void;
+  onDeleteConversation?: (conversationId: string) => void;
+  onClearConversation?: (conversationId: string) => void;
 }
 
 export const MediaActionsPanel: React.FC<MediaActionsPanelProps> = ({
@@ -31,9 +34,12 @@ export const MediaActionsPanel: React.FC<MediaActionsPanelProps> = ({
   onStartCall,
   onSendMessage,
   onImageClick,
+  onDeleteConversation,
+  onClearConversation,
 }) => {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const cameraInputRef = useRef<HTMLInputElement>(null);
+  const [confirmDelete, setConfirmDelete] = useState(false);
 
   // Modals for quick actions
   const [showTransferModal, setShowTransferModal] = useState(false);
@@ -228,12 +234,58 @@ export const MediaActionsPanel: React.FC<MediaActionsPanelProps> = ({
         {/* Contact Card */}
         <button
           onClick={() => setShowContactModal(true)}
-          className="h-16 rounded-2xl bg-[#16161a] hover:bg-[#1f1f26] border border-[#222228] flex flex-col items-center justify-center gap-1.5 text-slate-200 hover:text-white transition"
+          className="h-16 rounded-2xl bg-[#16161a] hover:bg-[#1f1f26] border border-[#222228] flex flex-col items-center justify-center gap-1.5 text-slate-200 hover:text-white transition cursor-pointer"
         >
           <UserCheck className="w-4 h-4 text-slate-300" />
           <span className="text-[11px] font-medium tracking-wide">Contact Card</span>
         </button>
       </div>
+
+      {/* Delete / Clear Chat Controls */}
+      {(onDeleteConversation || onClearConversation) && (
+        <div className="mt-3 pt-3 border-t border-white/10 space-y-2">
+          {onClearConversation && (
+            <button
+              onClick={() => onClearConversation(conversation.id)}
+              className="w-full py-2 px-3 rounded-xl bg-[#141418] hover:bg-[#1d1d24] border border-[#222228] text-xs font-semibold text-neutral-300 hover:text-white flex items-center justify-center gap-2 transition cursor-pointer"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+              <span>Clear Chat Messages</span>
+            </button>
+          )}
+          {onDeleteConversation &&
+            (confirmDelete ? (
+              <div className="p-2 rounded-xl bg-white/10 border border-white/30 flex items-center justify-between gap-2">
+                <span className="text-xs font-bold text-white pl-1">Delete chat?</span>
+                <div className="flex items-center gap-1.5">
+                  <button
+                    onClick={() => {
+                      setConfirmDelete(false);
+                      onDeleteConversation(conversation.id);
+                    }}
+                    className="px-3 py-1 rounded-lg bg-white text-black text-xs font-bold hover:bg-neutral-200 transition cursor-pointer"
+                  >
+                    Delete
+                  </button>
+                  <button
+                    onClick={() => setConfirmDelete(false)}
+                    className="px-2 py-1 rounded-lg bg-white/10 text-xs text-neutral-300 hover:text-white transition cursor-pointer"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <button
+                onClick={() => setConfirmDelete(true)}
+                className="w-full py-2 px-3 rounded-xl bg-white text-black hover:bg-neutral-200 text-xs font-bold flex items-center justify-center gap-2 transition cursor-pointer"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                <span>Delete Conversation</span>
+              </button>
+            ))}
+        </div>
+      )}
 
       {/* Transfer Modal */}
       {showTransferModal && (

@@ -5,6 +5,8 @@ import {
   signOutFirebaseSession,
   syncConversationToFirestore,
   fetchConversationsFromFirestore,
+  deleteConversationFromFirestore,
+  clearConversationMessagesFromFirestore,
   syncMessageToFirestore,
   deleteMessageFromFirestore,
   fetchMessagesFromFirestore,
@@ -12,6 +14,8 @@ import {
   syncStoryToFirestore,
   deleteStoryFromFirestore,
   fetchStoriesFromFirestore,
+  getCanonicalDirectConversationId,
+  cacheDirectoryUsers,
 } from './firebase';
 
 const REMOTE_API_ORIGIN = 'https://ais-pre-jpz57iqlur4hyo5s2f2gkp-455372508405.asia-southeast1.run.app';
@@ -39,10 +43,63 @@ class ApiClient {
       localStorage.setItem('aether_user', JSON.stringify(user));
       this.upsertLocalUsers([user]);
       void syncUserToCloudDirectory(user);
+      void this.pushUserToRemoteDirectory(user);
     } else {
       localStorage.removeItem('aether_token');
       localStorage.removeItem('aether_user');
     }
+  }
+
+  private async pushUserToRemoteDirectory(user: User): Promise<void> {
+    if (!user || typeof window === 'undefined') return;
+    try {
+      await fetch('/api/users/directory', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ user }),
+      }).catch(() => {});
+
+      if (!window.location.origin.includes('ais-pre-jpz57iqlur4hyo5s2f2gkp')) {
+        await fetch(`${REMOTE_API_ORIGIN}/api/users/directory`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ user }),
+        }).catch(() => {});
+      }
+    } catch {
+      // Non-blocking
+    }
+  }
+
+  private async fetchRemoteDirectoryUsers(): Promise<User[]> {
+    if (typeof window === 'undefined') return [];
+    const results: User[] = [];
+    try {
+      const localRes = await fetch('/api/users/directory').catch(() => null);
+      if (localRes && localRes.ok) {
+        const data = await localRes.json();
+        if (Array.isArray(data?.users)) results.push(...data.users);
+      }
+    } catch {
+      // Ignore
+    }
+    if (!window.location.origin.includes('ais-pre-jpz57iqlur4hyo5s2f2gkp')) {
+      try {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 2500);
+        const remoteRes = await fetch(`${REMOTE_API_ORIGIN}/api/users/directory`, {
+          signal: controller.signal,
+        });
+        clearTimeout(timer);
+        if (remoteRes.ok) {
+          const data = await remoteRes.json();
+          if (Array.isArray(data?.users)) results.push(...data.users);
+        }
+      } catch {
+        // Ignore
+      }
+    }
+    return results;
   }
 
   public getStoredUser(): User | null {
@@ -309,17 +366,31 @@ class ApiClient {
     if (endpoint === '/conversations' && method === 'POST') {
       const now = new Date().toISOString();
       const otherId = body.memberIds?.[0];
-      const otherUser = db.users.find(u => u.id === otherId);
+      const otherUser =
+        (Array.isArray(body.memberUsers) ? body.memberUsers[0] : undefined) ||
+        db.users.find(u => u.id === otherId || u.username === otherId);
+      const convType = body.type || 'direct';
       const convName =
-        body.type === 'direct' && otherUser ? otherUser.displayName : body.name || 'Chat';
+        convType === 'direct' && otherUser ? otherUser.displayName : body.name || 'Chat';
       const convAvatar =
-        body.type === 'direct' && otherUser
+        convType === 'direct' && otherUser
           ? otherUser.avatarUrl
           : `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(convName)}`;
 
+      const targetConvId =
+        body.id ||
+        (convType === 'direct'
+          ? getCanonicalDirectConversationId(currentUser, otherUser || otherId)
+          : `c_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`);
+
+      const existingConv = db.conversations.find(c => c.id === targetConvId);
+      if (existingConv) {
+        return { conversation: existingConv } as unknown as T;
+      }
+
       const newConv: Conversation = {
-        id: `c_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-        type: body.type || 'direct',
+        id: targetConvId,
+        type: convType,
         name: convName,
         description: body.description,
         avatarUrl: convAvatar,
@@ -332,7 +403,7 @@ class ApiClient {
             ? [
                 {
                   id: `cm_1_${Date.now()}`,
-                  conversationId: '',
+                  conversationId: targetConvId,
                   userId: currentUser.id,
                   user: currentUser,
                   role: 'owner' as const,
@@ -351,7 +422,7 @@ class ApiClient {
             ? [
                 {
                   id: `cm_2_${Date.now()}`,
-                  conversationId: '',
+                  conversationId: targetConvId,
                   userId: otherUser.id,
                   user: otherUser,
                   role: 'member' as const,
@@ -405,6 +476,24 @@ class ApiClient {
         this.saveClientDb(db);
         return { message: newMsg } as unknown as T;
       }
+      if (method === 'DELETE') {
+        db.messages[convId] = [];
+        const convIdx = db.conversations.findIndex(c => c.id === convId);
+        if (convIdx >= 0) {
+          db.conversations[convIdx].lastMessage = undefined;
+        }
+        this.saveClientDb(db);
+        return { success: true, conversationId: convId } as unknown as T;
+      }
+    }
+
+    const delConvMatch = endpoint.match(/^\/conversations\/([^/]+)$/);
+    if (delConvMatch && method === 'DELETE') {
+      const convId = delConvMatch[1];
+      db.conversations = db.conversations.filter(c => c.id !== convId);
+      delete db.messages[convId];
+      this.saveClientDb(db);
+      return { success: true, conversationId: convId } as unknown as T;
     }
 
     if (endpoint.endsWith('/read') && method === 'POST') {
@@ -545,6 +634,7 @@ class ApiClient {
     if (changed) {
       this.saveClientDb(db);
     }
+    cacheDirectoryUsers(db.users);
   }
 
   private mergeDirectoryUsers(lists: User[][], queryStr = ''): User[] {
@@ -813,6 +903,8 @@ class ApiClient {
     });
     if (res.user) {
       this.upsertLocalUsers([res.user]);
+      void syncUserToCloudDirectory(res.user);
+      void this.pushUserToRemoteDirectory(res.user);
     }
     return res.user;
   }
@@ -827,6 +919,7 @@ class ApiClient {
       const res = await this.getMe();
       if (res.user) {
         void syncUserToCloudDirectory(res.user);
+        void this.pushUserToRemoteDirectory(res.user);
       }
       return res.user;
     } catch {
@@ -841,6 +934,7 @@ class ApiClient {
     });
     if (res.user) {
       void syncUserToCloudDirectory(res.user);
+      void this.pushUserToRemoteDirectory(res.user);
     }
     return res.user;
   }
@@ -848,15 +942,23 @@ class ApiClient {
   // Users & Search
   public async searchUsers(query: string): Promise<User[]> {
     const currentUser = this.getStoredUser();
-    const [apiRes, cloudUsers] = await Promise.all([
+    if (currentUser) {
+      void syncUserToCloudDirectory(currentUser);
+      void this.pushUserToRemoteDirectory(currentUser);
+    }
+    const [apiRes, cloudUsers, remoteUsers] = await Promise.all([
       this.request<{ users: User[] }>(`/users/search?q=${encodeURIComponent(query)}`).catch(() => ({
         users: [] as User[],
       })),
       fetchCloudDirectoryUsers(currentUser).catch(() => [] as User[]),
+      this.fetchRemoteDirectoryUsers().catch(() => [] as User[]),
     ]);
 
-    const merged = this.mergeDirectoryUsers([apiRes.users || [], cloudUsers], query);
-    if (cloudUsers.length > 0) {
+    const merged = this.mergeDirectoryUsers(
+      [apiRes.users || [], cloudUsers, remoteUsers],
+      query
+    );
+    if (cloudUsers.length > 0 || remoteUsers.length > 0) {
       void this.request('/users/sync', {
         method: 'POST',
         body: JSON.stringify({ users: merged }),
@@ -867,15 +969,23 @@ class ApiClient {
 
   public async getContacts(): Promise<User[]> {
     const currentUser = this.getStoredUser();
-    const [apiRes, cloudUsers] = await Promise.all([
+    if (currentUser) {
+      void syncUserToCloudDirectory(currentUser);
+      void this.pushUserToRemoteDirectory(currentUser);
+    }
+    const [apiRes, cloudUsers, remoteUsers] = await Promise.all([
       this.request<{ contacts: User[] }>('/users/contacts').catch(() => ({
         contacts: [] as User[],
       })),
       fetchCloudDirectoryUsers(currentUser).catch(() => [] as User[]),
+      this.fetchRemoteDirectoryUsers().catch(() => [] as User[]),
     ]);
 
-    const merged = this.mergeDirectoryUsers([apiRes.contacts || [], cloudUsers], '');
-    if (cloudUsers.length > 0) {
+    const merged = this.mergeDirectoryUsers(
+      [apiRes.contacts || [], cloudUsers, remoteUsers],
+      ''
+    );
+    if (cloudUsers.length > 0 || remoteUsers.length > 0) {
       void this.request('/users/sync', {
         method: 'POST',
         body: JSON.stringify({ users: merged }),
@@ -907,10 +1017,73 @@ class ApiClient {
     return res.success;
   }
 
+  private getDeletedConvMap(): Record<string, number> {
+    if (typeof window === 'undefined') return {};
+    try {
+      const raw = localStorage.getItem('aether_deleted_convs');
+      if (!raw) return {};
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        const map: Record<string, number> = {};
+        for (const id of parsed) {
+          if (typeof id === 'string') map[id] = Date.now();
+        }
+        return map;
+      }
+      if (parsed && typeof parsed === 'object') {
+        return parsed as Record<string, number>;
+      }
+      return {};
+    } catch {
+      return {};
+    }
+  }
+
+  private markConvDeleted(convId: string, isDeleted: boolean) {
+    if (typeof window === 'undefined' || !convId) return;
+    try {
+      const map = this.getDeletedConvMap();
+      if (isDeleted) {
+        map[convId] = Date.now();
+      } else {
+        delete map[convId];
+      }
+      localStorage.setItem('aether_deleted_convs', JSON.stringify(map));
+    } catch {
+      // Ignore
+    }
+  }
+
+  public unmarkConvDeleted(convId: string) {
+    this.markConvDeleted(convId, false);
+  }
+
+  private mirrorToRemoteOrigin(endpoint: string, options: RequestInit) {
+    if (typeof window === 'undefined') return;
+    if (window.location.origin.includes('ais-pre-jpz57iqlur4hyo5s2f2gkp')) return;
+    const storedUser = this.getStoredUser();
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+    };
+    if (this.token) headers['Authorization'] = `Bearer ${this.token}`;
+    if (storedUser?.id) headers['X-User-Id'] = storedUser.id;
+    if (storedUser?.email) headers['X-User-Email'] = storedUser.email;
+    if (storedUser?.displayName) headers['X-User-Name'] = storedUser.displayName;
+
+    fetch(`${REMOTE_API_ORIGIN}/api${endpoint}`, {
+      ...options,
+      headers,
+    }).catch(() => {});
+  }
+
   // Conversations
   public async getConversations(): Promise<Conversation[]> {
     const currentUser = this.getStoredUser();
     const localDb = this.getClientDb();
+    if (localDb.users.length > 0) cacheDirectoryUsers(localDb.users);
+    if (currentUser) cacheDirectoryUsers([currentUser]);
+
+    const deletedMap = this.getDeletedConvMap();
     const [res, cloudConvs] = await Promise.all([
       this.request<{ conversations: Conversation[] }>('/conversations').catch(() => ({
         conversations: [] as Conversation[],
@@ -921,29 +1094,91 @@ class ApiClient {
     const rawConvs = [...(res.conversations || []), ...cloudConvs];
     const convById = new Map<string, Conversation>();
     const memberUsers: User[] = [];
+
     for (const c of rawConvs) {
       if (!c || !c.id) continue;
+      const deletedAt = deletedMap[c.id];
+      if (deletedAt) {
+        const lastMsgTime = c.lastMessage?.createdAt
+          ? new Date(c.lastMessage.createdAt).getTime()
+          : 0;
+        // If a brand-new message arrived AFTER the user deleted the conversation, un-delete it so it reaches them
+        if (lastMsgTime > deletedAt + 1000) {
+          this.markConvDeleted(c.id, false);
+          delete deletedMap[c.id];
+        } else {
+          continue;
+        }
+      }
+
+      const existing = convById.get(c.id);
       const memById = new Map<string, (typeof c.members)[number]>();
-      for (const m of c.members || []) {
+      for (const m of [...(existing?.members || []), ...(c.members || [])]) {
         if (!m) continue;
-        const memKey = m.userId || m.id;
-        if (memKey) memById.set(memKey, m);
+        const memKey = m.user?.username
+          ? m.user.username.toLowerCase()
+          : m.userId || m.id;
+        if (memKey) {
+          const prevMem = memById.get(memKey);
+          memById.set(memKey, {
+            ...(prevMem || {}),
+            ...m,
+            user: m.user || prevMem?.user,
+          });
+        }
         if (m.user) memberUsers.push(m.user);
       }
-      const existing = convById.get(c.id);
+
+      // Prefer the newer or real message over synthetic preview
+      let bestLastMsg = c.lastMessage || existing?.lastMessage;
+      if (c.lastMessage && existing?.lastMessage) {
+        const isCPreview = c.lastMessage.id.startsWith('m_preview_');
+        const isExistingPreview = existing.lastMessage.id.startsWith('m_preview_');
+        if (isCPreview && !isExistingPreview) {
+          bestLastMsg = existing.lastMessage;
+        } else if (!isCPreview && isExistingPreview) {
+          bestLastMsg = c.lastMessage;
+        } else {
+          const timeC = new Date(c.lastMessage.createdAt).getTime();
+          const timeEx = new Date(existing.lastMessage.createdAt).getTime();
+          bestLastMsg = timeC >= timeEx ? c.lastMessage : existing.lastMessage;
+        }
+      }
+
       convById.set(c.id, {
         ...(existing || {}),
         ...c,
+        name:
+          existing?.name && existing.name !== 'Chat' && existing.name !== 'Direct Chat'
+            ? existing.name
+            : c.name,
+        avatarUrl: existing?.avatarUrl || c.avatarUrl,
         members: Array.from(memById.values()),
-        lastMessage: c.lastMessage || existing?.lastMessage,
+        lastMessage: bestLastMsg,
       });
     }
+
     if (memberUsers.length > 0) {
       this.upsertLocalUsers(memberUsers);
     }
-    const mergedList = Array.from(convById.values());
+
+    const mergedList = Array.from(convById.values()).sort((a, b) => {
+      if (a.isPinned && !b.isPinned) return -1;
+      if (!a.isPinned && b.isPinned) return 1;
+      const timeA = a.lastMessage?.createdAt || a.createdAt;
+      const timeB = b.lastMessage?.createdAt || b.createdAt;
+      return new Date(timeB).getTime() - new Date(timeA).getTime();
+    });
+
+    // Save merged conversations into local client DB so sendMessage/getMessages always have member metadata
+    const freshDb = this.getClientDb();
+    freshDb.conversations = mergedList;
+    this.saveClientDb(freshDb);
+
     for (const conv of res.conversations || []) {
-      void syncConversationToFirestore(conv, currentUser);
+      if (!deletedMap[conv.id]) {
+        void syncConversationToFirestore(conv, currentUser);
+      }
     }
     return mergedList;
   }
@@ -951,6 +1186,42 @@ class ApiClient {
   public async getConversation(id: string): Promise<Conversation> {
     const res = await this.request<{ conversation: Conversation }>(`/conversations/${id}`);
     return res.conversation;
+  }
+
+  public async deleteConversation(conversationId: string): Promise<boolean> {
+    this.markConvDeleted(conversationId, true);
+    const db = this.getClientDb();
+    db.conversations = db.conversations.filter(c => c.id !== conversationId);
+    delete db.messages[conversationId];
+    this.saveClientDb(db);
+    void deleteConversationFromFirestore(conversationId);
+    try {
+      const res = await this.request<{ success: boolean }>(`/conversations/${conversationId}`, {
+        method: 'DELETE',
+      });
+      return res.success ?? true;
+    } catch {
+      return true;
+    }
+  }
+
+  public async clearConversationMessages(conversationId: string): Promise<boolean> {
+    const db = this.getClientDb();
+    db.messages[conversationId] = [];
+    const convIdx = db.conversations.findIndex(c => c.id === conversationId);
+    if (convIdx >= 0) {
+      db.conversations[convIdx].lastMessage = undefined;
+    }
+    this.saveClientDb(db);
+    void clearConversationMessagesFromFirestore(conversationId);
+    try {
+      const res = await this.request<{ success: boolean }>(`/conversations/${conversationId}/messages`, {
+        method: 'DELETE',
+      });
+      return res.success ?? true;
+    } catch {
+      return true;
+    }
   }
 
   public async createConversation(data: {
@@ -964,25 +1235,51 @@ class ApiClient {
   }): Promise<Conversation> {
     const db = this.getClientDb();
     const currentUser = this.getStoredUser();
+    if (db.users.length > 0) cacheDirectoryUsers(db.users);
+    if (currentUser) cacheDirectoryUsers([currentUser]);
+
     const memberUsers = (data.memberIds || [])
-      .map(id => db.users.find(u => u.id === id))
+      .map(id => db.users.find(u => u.id === id || u.username === id))
       .filter((u): u is User => Boolean(u));
+
+    const canonicalId =
+      data.type === 'direct'
+        ? getCanonicalDirectConversationId(currentUser, memberUsers[0] || data.memberIds?.[0])
+        : undefined;
+
+    const payload = {
+      ...data,
+      id: canonicalId,
+      memberUsers,
+      name:
+        data.name ||
+        (data.type === 'direct' && memberUsers[0]
+          ? memberUsers[0].displayName
+          : data.type === 'direct'
+          ? 'Direct Chat'
+          : 'New Group'),
+    };
 
     const res = await this.request<{ conversation: Conversation }>('/conversations', {
       method: 'POST',
-      body: JSON.stringify({
-        ...data,
-        memberUsers,
-        name:
-          data.name ||
-          (data.type === 'direct' && memberUsers[0]
-            ? memberUsers[0].displayName
-            : data.type === 'direct'
-            ? 'Direct Chat'
-            : 'New Group'),
-      }),
+      body: JSON.stringify(payload),
     });
+
+    this.mirrorToRemoteOrigin('/conversations', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+
     if (res.conversation) {
+      this.markConvDeleted(res.conversation.id, false);
+      const freshDb = this.getClientDb();
+      const existingIdx = freshDb.conversations.findIndex(c => c.id === res.conversation.id);
+      if (existingIdx >= 0) {
+        freshDb.conversations[existingIdx] = res.conversation;
+      } else {
+        freshDb.conversations.unshift(res.conversation);
+      }
+      this.saveClientDb(freshDb);
       void syncConversationToFirestore(res.conversation, currentUser);
     }
     return res.conversation;
@@ -998,11 +1295,13 @@ class ApiClient {
   public async getMessages(conversationId: string): Promise<Message[]> {
     const localDb = this.getClientDb();
     const currentUser = this.getStoredUser();
+    const conv = localDb.conversations.find(c => c.id === conversationId);
+
     const [res, cloudMsgs] = await Promise.all([
       this.request<{ messages: Message[] }>(`/conversations/${conversationId}/messages`).catch(() => ({
         messages: [] as Message[],
       })),
-      fetchMessagesFromFirestore(conversationId, localDb.users).catch(() => [] as Message[]),
+      fetchMessagesFromFirestore(conversationId, localDb.users, conv).catch(() => [] as Message[]),
     ]);
 
     const list = [...cloudMsgs, ...(res.messages || [])];
@@ -1014,22 +1313,64 @@ class ApiClient {
       }
     }
     for (const msg of res.messages || []) {
-      void syncMessageToFirestore(msg, currentUser);
+      void syncMessageToFirestore(msg, currentUser, conv);
     }
     const merged = Array.from(byId.values());
     merged.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+
+    const freshDb = this.getClientDb();
+    freshDb.messages[conversationId] = merged;
+    this.saveClientDb(freshDb);
+
     return merged;
   }
 
   public async sendMessage(data: { conversationId: string; [key: string]: any }): Promise<Message> {
     const currentUser = this.getStoredUser();
     const { conversationId, ...body } = data;
+    this.markConvDeleted(conversationId, false);
+
+    const localDb = this.getClientDb();
+    const conv = localDb.conversations.find(c => c.id === conversationId);
+    const memberUsers = [
+      ...(currentUser ? [currentUser] : []),
+      ...(conv?.members
+        ?.map(m => m.user || localDb.users.find(u => u.id === m.userId))
+        .filter((u): u is User => Boolean(u)) || []),
+    ];
+    const memberIds = Array.from(
+      new Set([
+        ...(conv?.members?.map(m => m.userId).filter(Boolean) || []),
+        ...memberUsers.map(u => u.id).filter(Boolean),
+      ])
+    );
+
+    const postBody = {
+      ...body,
+      conversationMeta: {
+        id: conversationId,
+        type: conv?.type || 'direct',
+        name: conv?.name || 'Direct Chat',
+        avatarUrl: conv?.avatarUrl,
+        memberIds,
+        memberUsers,
+      },
+    };
+
     const res = await this.request<{ message: Message }>(`/conversations/${conversationId}/messages`, {
       method: 'POST',
-      body: JSON.stringify(body),
+      body: JSON.stringify(postBody),
     });
+
     if (res.message) {
-      void syncMessageToFirestore(res.message, currentUser);
+      this.mirrorToRemoteOrigin(`/conversations/${conversationId}/messages`, {
+        method: 'POST',
+        body: JSON.stringify({
+          ...postBody,
+          id: res.message.id,
+        }),
+      });
+      void syncMessageToFirestore(res.message, currentUser, conv);
     }
     return res.message;
   }

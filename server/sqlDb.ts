@@ -208,6 +208,20 @@ export class SqlStorage {
     this.save();
   }
 
+  public clearConversationMessages(conversationId: string): void {
+    if (!this.db) return;
+    this.db.run('DELETE FROM messages WHERE conversation_id = ?;', [conversationId]);
+    this.save();
+  }
+
+  public deleteConversation(conversationId: string): void {
+    if (!this.db) return;
+    this.db.run('DELETE FROM messages WHERE conversation_id = ?;', [conversationId]);
+    this.db.run('DELETE FROM conversation_members WHERE conversation_id = ?;', [conversationId]);
+    this.db.run('DELETE FROM conversations WHERE id = ?;', [conversationId]);
+    this.save();
+  }
+
   public markMessagesRead(conversationId: string, userId: string): void {
     if (!this.db) return;
     this.db.run(

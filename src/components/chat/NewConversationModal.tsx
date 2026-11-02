@@ -128,9 +128,14 @@ export const NewConversationModal: React.FC<NewConversationModalProps> = ({
   const handleCreateDirect = async (targetUserId: string) => {
     setIsSubmitting(true);
     try {
+      const targetUser = directoryUsers.find(u => u.id === targetUserId);
       const conv = await api.createConversation({
         type: 'direct',
+        name: targetUser?.displayName,
+        avatarUrl: targetUser?.avatarUrl,
+        username: targetUser?.username,
         memberIds: [targetUserId],
+        memberUsers: targetUser ? [targetUser] : undefined,
       });
       onCreated(conv.id);
       onClose();
@@ -155,7 +160,11 @@ export const NewConversationModal: React.FC<NewConversationModalProps> = ({
       });
       const conv = await api.createConversation({
         type: 'direct',
+        name: foundUser.displayName,
+        avatarUrl: foundUser.avatarUrl,
+        username: foundUser.username,
         memberIds: [foundUser.id],
+        memberUsers: [foundUser],
       });
       onCreated(conv.id);
       onClose();

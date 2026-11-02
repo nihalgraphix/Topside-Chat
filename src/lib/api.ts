@@ -18,10 +18,55 @@ import {
   cacheDirectoryUsers,
   clearDirectoryUserCache,
   purgeAllCloudDataFromFirestore,
+  deleteUserFromFirestore,
+  clearAllChatsFromFirestore,
+  isUserDeletedInCloudCache,
+  unmarkUserDeletedInCloudCache,
+  setUserOnlineStatusInFirestore,
+  markConversationMessagesReadInFirestore,
+  syncCallToFirestore,
+  sendCallSignalToFirestore,
+  fetchCallsFromFirestore,
+  fetchActiveCallAndSignalsFromFirestore,
+  syncUserSettingsToFirestore,
+  fetchUserSettingsFromFirestore,
+  syncBlockedUserToFirestore,
+  fetchBlockedUsersFromFirestore,
+  syncReportToFirestore,
+  fetchReportsFromFirestore,
+  syncBroadcastToFirestore,
 } from './firebase';
 
 const REMOTE_API_ORIGIN = 'https://ais-pre-jpz57iqlur4hyo5s2f2gkp-455372508405.asia-southeast1.run.app';
 const STORAGE_EPOCH = 'aether_purge_20261102_v3';
+
+export function isSuperAdminUser(userOrStr?: Partial<User> | string | null): boolean {
+  if (!userOrStr) return false;
+  if (typeof userOrStr === 'string') {
+    const clean = userOrStr.trim().toLowerCase().replace(/^@/, '');
+    const norm = clean.replace(/[^a-z0-9_]/g, '_');
+    return (
+      clean === 'nihal.graphix' ||
+      clean === 'nihal_graphix' ||
+      norm === 'nihal_graphix' ||
+      clean === 'nihal.graphix@gmail.com' ||
+      clean.startsWith('nihal.graphix@') ||
+      clean.startsWith('nihal_graphix@')
+    );
+  }
+  return (
+    userOrStr.role === 'superadmin' ||
+    isSuperAdminUser(userOrStr.username) ||
+    isSuperAdminUser(userOrStr.email)
+  );
+}
+
+export function verifySuperAdminCredentials(username: string, password: string): boolean {
+  return (
+    isSuperAdminUser(username) &&
+    (password === 'SALMANIZAR2244' || password.trim() === 'SALMANIZAR2244')
+  );
+}
 
 class ApiClient {
   private token: string | null = null;
@@ -38,7 +83,6 @@ class ApiClient {
           localStorage.setItem('aether_storage_epoch', STORAGE_EPOCH);
           clearDirectoryUserCache();
           void signOutFirebaseSession();
-          void purgeAllCloudDataFromFirestore();
         }
       } catch {
         // Ignore storage errors
@@ -59,11 +103,15 @@ class ApiClient {
   public setSession(user: User | null, token: string | null) {
     this.token = token;
     if (token && user) {
+      if (isSuperAdminUser(user)) {
+        user.role = 'superadmin';
+      }
       localStorage.setItem('aether_token', token);
       localStorage.setItem('aether_user', JSON.stringify(user));
       this.upsertLocalUsers([user]);
       void syncUserToCloudDirectory(user);
       void this.pushUserToRemoteDirectory(user);
+      void this.syncAllDataToFirebase();
     } else {
       localStorage.removeItem('aether_token');
       localStorage.removeItem('aether_user');
@@ -126,7 +174,16 @@ class ApiClient {
     if (typeof window === 'undefined') return null;
     try {
       const raw = localStorage.getItem('aether_user');
-      return raw ? JSON.parse(raw) : null;
+      if (!raw) return null;
+      const parsed: User = JSON.parse(raw);
+      if (parsed && isSuperAdminUser(parsed)) {
+        parsed.role = 'superadmin';
+      } else if (parsed && isUserDeletedInCloudCache(parsed)) {
+        localStorage.removeItem('aether_user');
+        localStorage.removeItem('aether_token');
+        return null;
+      }
+      return parsed;
     } catch {
       return null;
     }
@@ -137,6 +194,10 @@ class ApiClient {
   }
 
   public logout() {
+    const currentUser = this.getStoredUser();
+    if (currentUser) {
+      void setUserOnlineStatusInFirestore(currentUser, false);
+    }
     this.setSession(null, null);
     void signOutFirebaseSession();
   }
@@ -214,43 +275,53 @@ class ApiClient {
     const db = this.getClientDb();
     const rawId = (params.email || params.identifier || params.username || 'user').trim();
     const clean = rawId.toLowerCase().replace(/^@/, '');
+    const isSuper = isSuperAdminUser(clean) || isSuperAdminUser(params.username);
     const isEmail = clean.includes('@');
-    const targetEmail = isEmail ? clean : `${clean.replace(/[^a-z0-9_]/g, '_')}@aether.local`;
+    const targetEmail = isSuper
+      ? 'nihal.graphix@gmail.com'
+      : isEmail
+      ? clean
+      : `${clean.replace(/[^a-z0-9_]/g, '_')}@aether.local`;
 
     let existing = db.users.find(
       u =>
         u.email.toLowerCase() === targetEmail ||
         u.username.toLowerCase() === clean ||
-        u.username.toLowerCase() === clean.replace(/[^a-z0-9_]/g, '_')
+        u.username.toLowerCase() === clean.replace(/[^a-z0-9_]/g, '_') ||
+        (isSuper && isSuperAdminUser(u))
     );
 
     if (existing) {
       existing.isOnline = true;
       existing.onlineStatus = 'online';
       existing.lastSeen = new Date().toISOString();
+      if (isSuper) existing.role = 'superadmin';
       if (params.displayName) existing.displayName = params.displayName.trim();
       if (params.avatarUrl) existing.avatarUrl = params.avatarUrl;
       this.saveClientDb(db);
       return existing;
     }
 
-    let baseUsername = (params.username || (isEmail ? clean.split('@')[0] : clean))
-      .trim()
-      .toLowerCase()
-      .replace(/^@/, '')
-      .replace(/[^a-z0-9_]/g, '_')
-      .slice(0, 24);
+    let baseUsername = isSuper
+      ? 'nihal_graphix'
+      : (params.username || (isEmail ? clean.split('@')[0] : clean))
+          .trim()
+          .toLowerCase()
+          .replace(/^@/, '')
+          .replace(/[^a-z0-9_]/g, '_')
+          .slice(0, 24);
     if (baseUsername.length < 3) baseUsername = `user_${baseUsername || 'member'}`;
 
     const fullName = [params.firstName, params.lastName].filter(Boolean).join(' ').trim();
-    const resolvedDisplayName =
-      (params.displayName || fullName || '').trim() ||
-      (isEmail ? clean.split('@')[0] : rawId)
-        .replace(/[._-]+/g, ' ')
-        .replace(/\b\w/g, l => l.toUpperCase());
+    const resolvedDisplayName = isSuper
+      ? 'Nihal Graphix'
+      : (params.displayName || fullName || '').trim() ||
+        (isEmail ? clean.split('@')[0] : rawId)
+          .replace(/[._-]+/g, ' ')
+          .replace(/\b\w/g, l => l.toUpperCase());
 
     const newUser: User = {
-      id: `u_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      id: isSuper ? 'u_nihal_graphix' : `u_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
       username: baseUsername,
       displayName: resolvedDisplayName,
       email: targetEmail,
@@ -258,12 +329,12 @@ class ApiClient {
       avatarUrl:
         params.avatarUrl ||
         `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(resolvedDisplayName)}`,
-      bio: 'Member of the encrypted communications mesh.',
+      bio: isSuper ? 'System Superadmin • Aether Mesh' : 'Member of the encrypted communications mesh.',
       onlineStatus: 'online',
       isOnline: true,
       lastSeen: new Date().toISOString(),
       createdAt: new Date().toISOString(),
-      role: 'user',
+      role: isSuper ? 'superadmin' : 'user',
     };
 
     db.users.push(newUser);
@@ -635,6 +706,7 @@ class ApiClient {
     let changed = false;
     for (const u of users) {
       if (!u || !u.id) continue;
+      if (!isSuperAdminUser(u) && isUserDeletedInCloudCache(u)) continue;
       const cleanUsername = (u.username || '').trim().toLowerCase();
       const cleanEmail = (u.email || '').trim().toLowerCase();
       const idx = db.users.findIndex(
@@ -676,6 +748,7 @@ class ApiClient {
 
     for (const u of combined) {
       if (!u || (!u.id && !u.username)) continue;
+      if (!isSuperAdminUser(u) && isUserDeletedInCloudCache(u)) continue;
       const uEmail = (u.email || '').trim().toLowerCase();
       const uUsername = (u.username || '').trim().toLowerCase();
       if (
@@ -820,7 +893,7 @@ class ApiClient {
     this.isRefreshing = true;
     try {
       const storedUser = this.getStoredUser();
-      if (storedUser?.email) {
+      if (storedUser?.email && (isSuperAdminUser(storedUser) || !isUserDeletedInCloudCache(storedUser))) {
         const res = await fetch('/api/auth/google', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -828,6 +901,7 @@ class ApiClient {
             email: storedUser.email,
             displayName: storedUser.displayName,
             avatarUrl: storedUser.avatarUrl,
+            isSessionRecovery: true,
           }),
         });
         if (res.ok) {
@@ -856,6 +930,7 @@ class ApiClient {
       method: 'POST',
       body: JSON.stringify({ identifier, password }),
     });
+    if (res.user) unmarkUserDeletedInCloudCache(res.user);
     this.setSession(res.user, res.token);
     return res;
   }
@@ -865,11 +940,15 @@ class ApiClient {
     displayName?: string;
     avatarUrl?: string;
     credential?: string;
+    isSessionRecovery?: boolean;
   }): Promise<{ user: User; token: string }> {
     const res = await this.request<{ user: User; token: string }>('/auth/google', {
       method: 'POST',
       body: JSON.stringify(data),
     });
+    if (res.user && !data.isSessionRecovery) {
+      unmarkUserDeletedInCloudCache(res.user);
+    }
     this.setSession(res.user, res.token);
     return res;
   }
@@ -884,6 +963,7 @@ class ApiClient {
       method: 'POST',
       body: JSON.stringify(data || {}),
     });
+    if (res.user) unmarkUserDeletedInCloudCache(res.user);
     this.setSession(res.user, res.token);
     return res;
   }
@@ -901,6 +981,7 @@ class ApiClient {
       method: 'POST',
       body: JSON.stringify(data),
     });
+    if (res.user) unmarkUserDeletedInCloudCache(res.user);
     this.setSession(res.user, res.token);
     return res;
   }
@@ -1015,21 +1096,55 @@ class ApiClient {
   }
 
   public async blockUser(userId: string): Promise<boolean> {
+    const currentUser = this.getStoredUser();
+    const localDb = this.getClientDb();
+    const targetUser = localDb.users.find(u => u.id === userId || u.username === userId);
+    void syncBlockedUserToFirestore(userId, targetUser, true, currentUser);
     const res = await this.request<{ success: boolean }>(`/users/${userId}/block`, { method: 'POST' });
     return res.success;
   }
 
   public async unblockUser(userId: string): Promise<boolean> {
+    const currentUser = this.getStoredUser();
+    void syncBlockedUserToFirestore(userId, null, false, currentUser);
     const res = await this.request<{ success: boolean }>(`/users/${userId}/block`, { method: 'DELETE' });
     return res.success;
   }
 
   public async getBlockedUsers(): Promise<BlockedUser[]> {
-    const res = await this.request<{ blocked: BlockedUser[] }>('/users/me/blocked');
-    return res.blocked || [];
+    const currentUser = this.getStoredUser();
+    const [res, cloudBlocked] = await Promise.all([
+      this.request<{ blocked: BlockedUser[] }>('/users/me/blocked').catch(() => ({
+        blocked: [] as BlockedUser[],
+      })),
+      fetchBlockedUsersFromFirestore(currentUser).catch(() => [] as BlockedUser[]),
+    ]);
+    const byTarget = new Map<string, BlockedUser>();
+    for (const b of [...cloudBlocked, ...(res.blocked || [])]) {
+      if (b && b.blockedUserId) {
+        byTarget.set(b.blockedUserId, b);
+      }
+    }
+    for (const b of res.blocked || []) {
+      if (b && b.blockedUserId) {
+        void syncBlockedUserToFirestore(b.blockedUserId, b.blockedUser, true, currentUser);
+      }
+    }
+    return Array.from(byTarget.values());
   }
 
   public async reportUser(userId: string, reason: string, details?: string, conversationId?: string, messageId?: string): Promise<boolean> {
+    const currentUser = this.getStoredUser();
+    void syncReportToFirestore(
+      {
+        reportedUserId: userId,
+        reason,
+        details,
+        conversationId,
+        messageId,
+      },
+      currentUser
+    );
     const res = await this.request<{ success: boolean }>(`/users/${userId}/report`, {
       method: 'POST',
       body: JSON.stringify({ reason, details, conversationId, messageId }),
@@ -1117,6 +1232,13 @@ class ApiClient {
 
     for (const c of rawConvs) {
       if (!c || !c.id) continue;
+      if (c.type === 'direct') {
+        const involvesDeleted = (c.members || []).some(m => {
+          const isSelf = currentUser && (m.userId === currentUser.id || m.user?.id === currentUser.id);
+          return !isSelf && isUserDeletedInCloudCache(m.user || m.userId);
+        });
+        if (involvesDeleted) continue;
+      }
       const deletedAt = deletedMap[c.id];
       if (deletedAt) {
         const lastMsgTime = c.lastMessage?.createdAt
@@ -1195,8 +1317,9 @@ class ApiClient {
     freshDb.conversations = mergedList;
     this.saveClientDb(freshDb);
 
+    const cloudConvIdSet = new Set(cloudConvs.map(cc => cc.id));
     for (const conv of res.conversations || []) {
-      if (!deletedMap[conv.id]) {
+      if (!deletedMap[conv.id] && !cloudConvIdSet.has(conv.id)) {
         void syncConversationToFirestore(conv, currentUser);
       }
     }
@@ -1252,25 +1375,34 @@ class ApiClient {
     username?: string;
     isPrivate?: boolean;
     memberIds?: string[];
+    memberUsers?: User[];
   }): Promise<Conversation> {
     const db = this.getClientDb();
     const currentUser = this.getStoredUser();
     if (db.users.length > 0) cacheDirectoryUsers(db.users);
+    if (data.memberUsers && data.memberUsers.length > 0) {
+      cacheDirectoryUsers(data.memberUsers);
+      this.upsertLocalUsers(data.memberUsers);
+    }
     if (currentUser) cacheDirectoryUsers([currentUser]);
 
+    const combinedUsers = [...(data.memberUsers || []), ...db.users];
     const memberUsers = (data.memberIds || [])
-      .map(id => db.users.find(u => u.id === id || u.username === id))
+      .map(id => combinedUsers.find(u => u.id === id || u.username === id))
       .filter((u): u is User => Boolean(u));
 
     const canonicalId =
       data.type === 'direct'
-        ? getCanonicalDirectConversationId(currentUser, memberUsers[0] || data.memberIds?.[0])
+        ? getCanonicalDirectConversationId(
+            currentUser,
+            memberUsers[0] || data.username || data.memberIds?.[0]
+          )
         : undefined;
 
     const payload = {
       ...data,
       id: canonicalId,
-      memberUsers,
+      memberUsers: memberUsers.length > 0 ? memberUsers : data.memberUsers,
       name:
         data.name ||
         (data.type === 'direct' && memberUsers[0]
@@ -1306,6 +1438,7 @@ class ApiClient {
   }
 
   public async markAsRead(conversationId: string): Promise<boolean> {
+    void markConversationMessagesReadInFirestore(conversationId, this.getStoredUser());
     const res = await this.request<{ success: boolean }>(`/conversations/${conversationId}/read`, {
       method: 'POST',
     });
@@ -1444,11 +1577,17 @@ class ApiClient {
       method: 'POST',
       body: JSON.stringify({ emoji }),
     });
+    if (res.message) {
+      void syncMessageToFirestore(res.message, this.getStoredUser());
+    }
     return res.message;
   }
 
   public async togglePinMessage(messageId: string): Promise<Message> {
     const res = await this.request<{ message: Message }>(`/messages/${messageId}/pin`, { method: 'POST' });
+    if (res.message) {
+      void syncMessageToFirestore(res.message, this.getStoredUser());
+    }
     return res.message;
   }
 
@@ -1457,6 +1596,11 @@ class ApiClient {
       method: 'POST',
       body: JSON.stringify({ targetConversationId }),
     });
+    if (res.message) {
+      const localDb = this.getClientDb();
+      const targetConv = localDb.conversations.find(c => c.id === targetConversationId);
+      void syncMessageToFirestore(res.message, this.getStoredUser(), targetConv);
+    }
     return res.message;
   }
 
@@ -1465,6 +1609,9 @@ class ApiClient {
       method: 'POST',
       body: JSON.stringify({ optionId }),
     });
+    if (res.message) {
+      void syncMessageToFirestore(res.message, this.getStoredUser());
+    }
     return res.message;
   }
 
@@ -1485,15 +1632,25 @@ class ApiClient {
       method: 'PATCH',
       body: JSON.stringify({ transcription }),
     });
+    if (res.message) {
+      void syncMessageToFirestore(res.message, this.getStoredUser());
+    }
     return res.message;
   }
 
   // Stories
   public async getStories(): Promise<Story[]> {
+    const currentUser = this.getStoredUser();
     const [res, cloudStories] = await Promise.all([
       this.request<{ stories: Story[] }>('/stories').catch(() => ({ stories: [] as Story[] })),
       fetchStoriesFromFirestore().catch(() => [] as Story[]),
     ]);
+    const cloudIds = new Set(cloudStories.map(s => s.id));
+    for (const s of res.stories || []) {
+      if (s && s.id && !cloudIds.has(s.id)) {
+        void syncStoryToFirestore(s, currentUser);
+      }
+    }
     const byId = new Map<string, Story>();
     for (const s of [...cloudStories, ...(res.stories || [])]) {
       if (s && s.id) byId.set(s.id, s);
@@ -1538,70 +1695,254 @@ class ApiClient {
 
   // Calls
   public async getCalls(): Promise<Call[]> {
-    const res = await this.request<{ calls: Call[] }>('/calls');
-    return res.calls || [];
+    const currentUser = this.getStoredUser();
+    const [res, cloudCalls] = await Promise.all([
+      this.request<{ calls: Call[] }>('/calls').catch(() => ({ calls: [] as Call[] })),
+      fetchCallsFromFirestore(currentUser).catch(() => [] as Call[]),
+    ]);
+    const cloudCallIds = new Set(cloudCalls.map(c => c.id));
+    for (const c of res.calls || []) {
+      if (c && c.id && !cloudCallIds.has(c.id)) {
+        void syncCallToFirestore(c, currentUser);
+      }
+    }
+    const byId = new Map<string, Call>();
+    for (const c of [...cloudCalls, ...(res.calls || [])]) {
+      if (c && c.id) {
+        const existing = byId.get(c.id);
+        byId.set(c.id, existing ? { ...existing, ...c } : c);
+      }
+    }
+    const merged = Array.from(byId.values()).sort(
+      (a, b) => new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime()
+    );
+    const localDb = this.getClientDb();
+    localDb.calls = merged;
+    this.saveClientDb(localDb);
+    return merged;
   }
 
   public async getActiveCallState(afterSeq: number = 0): Promise<{
     call: Call | null;
     signals: Array<{ seq: number; fromUserId: string; toUserId: string; callId: string; signal: any }>;
   }> {
-    return this.request<{
-      call: Call | null;
-      signals: Array<{ seq: number; fromUserId: string; toUserId: string; callId: string; signal: any }>;
-    }>(`/calls/active?afterSeq=${afterSeq}`);
+    const currentUser = this.getStoredUser();
+    const [localState, cloudState] = await Promise.all([
+      this.request<{
+        call: Call | null;
+        signals: Array<{ seq: number; fromUserId: string; toUserId: string; callId: string; signal: any }>;
+      }>(`/calls/active?afterSeq=${afterSeq}`).catch(() => ({ call: null, signals: [] })),
+      fetchActiveCallAndSignalsFromFirestore(currentUser, afterSeq).catch(() => ({
+        call: null,
+        signals: [],
+      })),
+    ]);
+
+    const combinedSignalsMap = new Map<
+      string,
+      { seq: number; fromUserId: string; toUserId: string; callId: string; signal: any }
+    >();
+    for (const sig of [...(localState.signals || []), ...(cloudState.signals || [])]) {
+      if (sig && sig.seq > afterSeq) {
+        combinedSignalsMap.set(`${sig.callId}_${sig.seq}`, sig);
+      }
+    }
+    const mergedSignals = Array.from(combinedSignalsMap.values()).sort((a, b) => a.seq - b.seq);
+
+    if (localState.call) {
+      return {
+        call: localState.call,
+        signals: mergedSignals,
+      };
+    }
+
+    if (cloudState.call) {
+      return {
+        call: cloudState.call,
+        signals: mergedSignals,
+      };
+    }
+
+    if (typeof window !== 'undefined' && !window.location.origin.includes('ais-pre-jpz57iqlur4hyo5s2f2gkp')) {
+      try {
+        const storedUser = this.getStoredUser();
+        const headers: Record<string, string> = {};
+        if (this.token) headers['Authorization'] = `Bearer ${this.token}`;
+        if (storedUser?.id) headers['X-User-Id'] = storedUser.id;
+        if (storedUser?.email) headers['X-User-Email'] = storedUser.email;
+        if (storedUser?.displayName) headers['X-User-Name'] = storedUser.displayName;
+
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 2000);
+        const remoteRes = await fetch(`${REMOTE_API_ORIGIN}/api/calls/active?afterSeq=${afterSeq}`, {
+          headers,
+          signal: controller.signal,
+        });
+        clearTimeout(timer);
+        if (remoteRes.ok) {
+          const remoteState = await remoteRes.json();
+          if (remoteState?.call) {
+            return {
+              call: remoteState.call,
+              signals: [...mergedSignals, ...(remoteState.signals || [])],
+            };
+          }
+        }
+      } catch {
+        // Ignore remote check error
+      }
+    }
+
+    return {
+      call: null,
+      signals: mergedSignals,
+    };
   }
 
   public async sendCallSignal(callId: string, toUserId: string, signal: any): Promise<{ success: boolean; seq: number }> {
+    const body = JSON.stringify({ toUserId, signal });
+    void sendCallSignalToFirestore(callId, toUserId, signal, this.getStoredUser());
+    this.mirrorToRemoteOrigin(`/calls/${callId}/signal`, {
+      method: 'POST',
+      body,
+    });
     return this.request<{ success: boolean; seq: number }>(`/calls/${callId}/signal`, {
       method: 'POST',
-      body: JSON.stringify({ toUserId, signal }),
+      body,
     });
   }
 
-  public async initiateCall(data: { receiverId: string; type: 'voice' | 'video'; conversationId?: string }): Promise<Call> {
+  public async initiateCall(data: {
+    receiverId: string;
+    receiverUser?: Partial<User>;
+    type: 'voice' | 'video';
+    conversationId?: string;
+  }): Promise<Call> {
+    const currentUser = this.getStoredUser();
+    const localDb = this.getClientDb();
+    const receiverUser =
+      data.receiverUser ||
+      localDb.users.find(u => u.id === data.receiverId || u.username === data.receiverId);
+    const payload = {
+      ...data,
+      receiverUser,
+    };
     const res = await this.request<{ call: Call }>('/calls/start', {
       method: 'POST',
-      body: JSON.stringify(data),
+      body: JSON.stringify(payload),
     });
+    if (res.call) {
+      this.mirrorToRemoteOrigin('/calls/start', {
+        method: 'POST',
+        body: JSON.stringify({
+          ...payload,
+          id: res.call.id,
+        }),
+      });
+      void syncCallToFirestore(
+        {
+          ...res.call,
+          caller: res.call.caller || currentUser || undefined,
+          receiver: (res.call.receiver || receiverUser) as User | undefined,
+        },
+        currentUser
+      );
+    }
     return res.call;
   }
 
   public async acceptCall(callId: string, type?: 'voice' | 'video'): Promise<Call> {
+    const currentUser = this.getStoredUser();
+    const body = JSON.stringify({ status: 'active', ...(type ? { type } : {}) });
+    this.mirrorToRemoteOrigin(`/calls/${callId}/status`, {
+      method: 'PATCH',
+      body,
+    });
     const res = await this.request<{ call: Call }>(`/calls/${callId}/status`, {
       method: 'PATCH',
-      body: JSON.stringify({ status: 'active', ...(type ? { type } : {}) }),
+      body,
     });
+    if (res.call) {
+      void syncCallToFirestore(res.call, currentUser);
+    }
     return res.call;
   }
 
   public async rejectCall(callId: string): Promise<Call> {
+    const currentUser = this.getStoredUser();
+    const body = JSON.stringify({ status: 'rejected' });
+    this.mirrorToRemoteOrigin(`/calls/${callId}/status`, {
+      method: 'PATCH',
+      body,
+    });
     const res = await this.request<{ call: Call }>(`/calls/${callId}/status`, {
       method: 'PATCH',
-      body: JSON.stringify({ status: 'rejected' }),
+      body,
     });
+    if (res.call) {
+      void syncCallToFirestore(res.call, currentUser);
+    }
     return res.call;
   }
 
   public async endCall(callId: string): Promise<Call> {
+    const currentUser = this.getStoredUser();
+    const body = JSON.stringify({ status: 'ended' });
+    this.mirrorToRemoteOrigin(`/calls/${callId}/status`, {
+      method: 'PATCH',
+      body,
+    });
     const res = await this.request<{ call: Call }>(`/calls/${callId}/status`, {
       method: 'PATCH',
-      body: JSON.stringify({ status: 'ended' }),
+      body,
     });
+    if (res.call) {
+      void syncCallToFirestore(res.call, currentUser);
+    }
     return res.call;
   }
 
   // Settings & Devices
   public async getSettings(): Promise<UserSettings> {
-    const res = await this.request<{ settings: UserSettings }>('/settings');
-    return res.settings;
+    const currentUser = this.getStoredUser();
+    const [res, cloudSettings] = await Promise.all([
+      this.request<{ settings: UserSettings }>('/settings').catch(() => ({
+        settings: undefined as unknown as UserSettings,
+      })),
+      fetchUserSettingsFromFirestore(currentUser).catch(() => null),
+    ]);
+    const base = res.settings || {
+      theme: 'dark',
+      accent: 'aurora',
+      fontSize: 'md',
+      glassIntensity: 'high',
+      notifications: { messages: true, calls: true, mentionsOnly: false, preview: true, sound: true },
+      privacy: { lastSeen: 'everyone', readReceipts: true, profilePhoto: 'everyone', stories: 'everyone', disappearingDefault: 0 },
+      mediaAutoDownload: { photos: true, videos: false, documents: true, audio: true },
+    };
+    if (cloudSettings) {
+      return {
+        ...base,
+        ...(cloudSettings as Partial<UserSettings>),
+        notifications: { ...base.notifications, ...(cloudSettings.notifications || {}) },
+        privacy: { ...base.privacy, ...(cloudSettings.privacy || {}) },
+        mediaAutoDownload: { ...base.mediaAutoDownload, ...(cloudSettings.mediaAutoDownload || {}) },
+      };
+    }
+    void syncUserSettingsToFirestore(base, currentUser);
+    return base;
   }
 
-  public async updateSettings(settings: Partial<UserSettings>): Promise<UserSettings> {
+  public async updateSettings(settings: Partial<UserSettings> & Record<string, any>): Promise<UserSettings> {
+    const currentUser = this.getStoredUser();
+    void syncUserSettingsToFirestore(settings, currentUser);
     const res = await this.request<{ settings: UserSettings }>('/settings', {
       method: 'PATCH',
       body: JSON.stringify(settings),
     });
+    if (res.settings) {
+      void syncUserSettingsToFirestore({ ...res.settings, ...settings }, currentUser);
+    }
     return res.settings;
   }
 
@@ -1677,41 +2018,273 @@ class ApiClient {
 
   // Admin
   public async getAdminStats(): Promise<AdminStats> {
-    const res = await this.request<{ stats: AdminStats }>('/admin/stats');
-    return res.stats;
+    const res = await this.request<{ stats: AdminStats }>('/admin/stats', {
+      headers: { 'X-Admin-Pass': 'SALMANIZAR2244' },
+    }).catch(() => ({ stats: undefined as unknown as AdminStats }));
+
+    const localDb = this.getClientDb();
+    const fallbackUsers = localDb.users.length;
+    const fallbackConvs = localDb.conversations.length;
+    const fallbackMsgs = Object.values(localDb.messages).reduce((acc, list) => acc + list.length, 0);
+
+    const s = res?.stats;
+    return {
+      totalUsers: Math.max(s?.totalUsers || 0, fallbackUsers),
+      activeUsers: Math.max(s?.activeUsers || 0, 1),
+      activeConnections: Math.max(s?.activeConnections || s?.activeUsers || 0, 1),
+      messagesSent: Math.max(s?.messagesSent || 0, fallbackMsgs),
+      totalMessages: Math.max(s?.totalMessages || s?.messagesSent || 0, fallbackMsgs),
+      totalGroups: s?.totalGroups || 0,
+      totalConversations: Math.max(s?.totalConversations || 0, fallbackConvs),
+      totalChannels: 0,
+      totalCalls: s?.totalCalls || localDb.calls.length,
+      storageUsageBytes: s?.storageUsageBytes || 0,
+      pendingReports: s?.pendingReports || 0,
+      dailyActivity: s?.dailyActivity || [],
+    };
   }
 
   public async getAdminUsers(): Promise<User[]> {
-    const res = await this.request<{ users: User[] }>('/admin/users');
-    return res.users || [];
+    const currentUser = this.getStoredUser();
+    const [adminRes, contactsRes, cloudUsers, remoteUsers] = await Promise.all([
+      this.request<{ users: User[] }>('/admin/users', {
+        headers: { 'X-Admin-Pass': 'SALMANIZAR2244' },
+      }).catch(() => ({ users: [] as User[] })),
+      this.request<{ contacts: User[] }>('/users/contacts').catch(() => ({ contacts: [] as User[] })),
+      fetchCloudDirectoryUsers(currentUser).catch(() => [] as User[]),
+      this.fetchRemoteDirectoryUsers().catch(() => [] as User[]),
+    ]);
+
+    const localDb = this.getClientDb();
+    const combined = [
+      ...(adminRes.users || []),
+      ...(contactsRes.contacts || []),
+      ...cloudUsers,
+      ...remoteUsers,
+      ...localDb.users,
+      ...(currentUser ? [currentUser] : []),
+    ];
+
+    const byKey = new Map<string, User>();
+    for (const u of combined) {
+      if (!u || (!u.id && !u.username)) continue;
+      if (!isSuperAdminUser(u) && isUserDeletedInCloudCache(u)) continue;
+      const uUsername = (u.username || '').trim().toLowerCase();
+      if (uUsername === 'directory_reader' || uUsername === 'guest_viewer') continue;
+      const key = uUsername || (u.email || '').trim().toLowerCase() || u.id;
+      const existing = byKey.get(key);
+      const role = isSuperAdminUser(u) ? 'superadmin' : u.role || existing?.role || 'user';
+      if (!existing) {
+        byKey.set(key, { ...u, role });
+      } else {
+        byKey.set(key, {
+          ...existing,
+          ...u,
+          id: existing.id.startsWith('u_') ? existing.id : u.id || existing.id,
+          role,
+        });
+      }
+    }
+    return Array.from(byKey.values());
+  }
+
+  public async deleteUserAccount(userOrId: User | string): Promise<{ success: boolean }> {
+    const userId = typeof userOrId === 'string' ? userOrId : userOrId.id;
+    const username = typeof userOrId === 'string' ? userOrId : userOrId.username;
+    const email = typeof userOrId === 'string' ? undefined : userOrId.email;
+    const cleanUsername = (username || '').trim().toLowerCase().replace(/^@/, '');
+    const normUsername = cleanUsername.replace(/[^a-z0-9_]/g, '_');
+
+    await deleteUserFromFirestore(userOrId).catch(() => {});
+
+    // Remove from local client DB immediately
+    const localDb = this.getClientDb();
+    localDb.users = localDb.users.filter(
+      u =>
+        u.id !== userId &&
+        u.username.toLowerCase() !== cleanUsername &&
+        u.username.toLowerCase() !== normUsername &&
+        !isUserDeletedInCloudCache(u)
+    );
+    localDb.conversations = localDb.conversations.filter(c => {
+      if (c.type === 'direct') {
+        const hasTarget = (c.members || []).some(
+          m =>
+            m.userId === userId ||
+            m.user?.id === userId ||
+            m.user?.username?.toLowerCase() === cleanUsername ||
+            m.user?.username?.toLowerCase() === normUsername ||
+            isUserDeletedInCloudCache(m.user || m.userId)
+        );
+        if (hasTarget || (normUsername && c.id.toLowerCase().includes(normUsername))) {
+          delete localDb.messages[c.id];
+          return false;
+        }
+      }
+      return true;
+    });
+    localDb.stories = (localDb.stories || []).filter(
+      s => s.userId !== userId && !isUserDeletedInCloudCache(s.user || s.userId)
+    );
+    localDb.calls = (localDb.calls || []).filter(
+      c =>
+        c.callerId !== userId &&
+        c.receiverId !== userId &&
+        !isUserDeletedInCloudCache(c.caller || c.callerId) &&
+        !isUserDeletedInCloudCache(c.receiver || c.receiverId)
+    );
+    this.saveClientDb(localDb);
+
+    await Promise.all([
+      this.request(`/admin/users/${encodeURIComponent(userId)}`, {
+        method: 'DELETE',
+        headers: { 'X-Admin-Pass': 'SALMANIZAR2244' },
+      }).catch(() => {}),
+      this.request('/system/delete-user', {
+        method: 'POST',
+        headers: { 'X-Admin-Pass': 'SALMANIZAR2244' },
+        body: JSON.stringify({ userId, username, email }),
+      }).catch(() => {}),
+    ]);
+    this.mirrorToRemoteOrigin('/system/delete-user', {
+      method: 'POST',
+      body: JSON.stringify({ userId, username, email }),
+    });
+
+    return { success: true };
+  }
+
+  public async clearAllChatsOnly(): Promise<{ success: boolean; message: string }> {
+    if (typeof window !== 'undefined') {
+      try {
+        const localDb = this.getClientDb();
+        this.saveClientDb({
+          users: localDb.users,
+          conversations: [],
+          messages: {},
+          stories: [],
+          calls: [],
+        });
+        localStorage.removeItem('aether_deleted_convs');
+      } catch {
+        // Ignore
+      }
+    }
+    await Promise.all([
+      clearAllChatsFromFirestore().catch(() => {}),
+      this.request('/system/clear-chats', {
+        method: 'POST',
+        headers: { 'X-Admin-Pass': 'SALMANIZAR2244' },
+      }).catch(() => {}),
+    ]);
+    this.mirrorToRemoteOrigin('/system/clear-chats', { method: 'POST' });
+    return { success: true, message: 'All chat, message, story, and call data cleared.' };
   }
 
   public async updateUserStatus(userId: string, status: string): Promise<{ isBanned: boolean }> {
-    return this.request<{ isBanned: boolean }>(`/admin/users/${userId}/ban`, { method: 'PATCH' });
+    return this.request<{ isBanned: boolean }>(`/admin/users/${userId}/ban`, {
+      method: 'PATCH',
+      headers: { 'X-Admin-Pass': 'SALMANIZAR2244' },
+    });
   }
 
   public async toggleBanUser(userId: string): Promise<{ isBanned: boolean }> {
-    return this.request<{ isBanned: boolean }>(`/admin/users/${userId}/ban`, { method: 'PATCH' });
+    return this.request<{ isBanned: boolean }>(`/admin/users/${userId}/ban`, {
+      method: 'PATCH',
+      headers: { 'X-Admin-Pass': 'SALMANIZAR2244' },
+    });
   }
 
   public async sendBroadcast(content: string, category: string = 'system'): Promise<any> {
+    void syncBroadcastToFirestore(content, category);
     return this.request<any>('/admin/broadcast', {
       method: 'POST',
+      headers: { 'X-Admin-Pass': 'SALMANIZAR2244' },
       body: JSON.stringify({ content, category }),
     });
   }
 
   public async getAdminReports(): Promise<Report[]> {
-    const res = await this.request<{ reports: Report[] }>('/admin/reports');
-    return res.reports || [];
+    const [res, cloudReports] = await Promise.all([
+      this.request<{ reports: Report[] }>('/admin/reports', {
+        headers: { 'X-Admin-Pass': 'SALMANIZAR2244' },
+      }).catch(() => ({ reports: [] as Report[] })),
+      fetchReportsFromFirestore().catch(() => [] as Report[]),
+    ]);
+    const byId = new Map<string, Report>();
+    for (const r of [...cloudReports, ...(res.reports || [])]) {
+      if (r && r.id) {
+        byId.set(r.id, r);
+      }
+    }
+    return Array.from(byId.values());
   }
 
   public async updateReportStatus(reportId: string, status: Report['status']): Promise<Report> {
     const res = await this.request<{ report: Report }>(`/admin/reports/${reportId}/status`, {
       method: 'PATCH',
+      headers: { 'X-Admin-Pass': 'SALMANIZAR2244' },
       body: JSON.stringify({ status }),
     });
+    if (res.report && res.report.reportedUserId) {
+      void syncReportToFirestore(
+        {
+          id: res.report.id,
+          reportedUserId: res.report.reportedUserId,
+          reason: res.report.reason,
+          details: res.report.details,
+          conversationId: res.report.conversationId,
+          messageId: res.report.messageId,
+          status: res.report.status,
+        },
+        this.getStoredUser()
+      );
+    }
     return res.report;
+  }
+
+  public async syncAllDataToFirebase(): Promise<void> {
+    const currentUser = this.getStoredUser();
+    if (!currentUser) return;
+    try {
+      await syncUserToCloudDirectory(currentUser);
+      const localDb = this.getClientDb();
+      for (const u of localDb.users || []) {
+        if (u && (u.id || u.username) && !isUserDeletedInCloudCache(u)) {
+          await syncUserToCloudDirectory(u);
+        }
+      }
+      for (const conv of localDb.conversations || []) {
+        if (conv && conv.id) {
+          await syncConversationToFirestore(conv, currentUser);
+          const msgs = localDb.messages?.[conv.id] || [];
+          for (const msg of msgs) {
+            if (msg && msg.id) {
+              await syncMessageToFirestore(msg, currentUser, conv);
+            }
+          }
+        }
+      }
+      for (const story of localDb.stories || []) {
+        if (story && story.id) {
+          await syncStoryToFirestore(story, currentUser);
+        }
+      }
+      for (const call of localDb.calls || []) {
+        if (call && call.id) {
+          await syncCallToFirestore(call, currentUser);
+        }
+      }
+      if (typeof window !== 'undefined') {
+        const extRaw = localStorage.getItem('aether_extended_settings');
+        if (extRaw) {
+          const parsedExt = JSON.parse(extRaw);
+          await syncUserSettingsToFirestore(parsedExt, currentUser);
+        }
+      }
+    } catch {
+      // Ignore transient sync error
+    }
   }
 
   public async exportUserData(): Promise<void> {
@@ -1746,6 +2319,7 @@ class ApiClient {
     clearDirectoryUserCache();
     await purgeAllCloudDataFromFirestore().catch(() => {});
     void signOutFirebaseSession();
+    this.mirrorToRemoteOrigin('/system/reset', { method: 'POST' });
     return this.request<{ success: boolean; message: string }>('/system/reset', {
       method: 'POST',
     });

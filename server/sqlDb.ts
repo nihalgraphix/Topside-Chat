@@ -443,6 +443,24 @@ export class SqlStorage {
     };
   }
 
+  public deleteUser(userId: string, username?: string): void {
+    if (!this.db) return;
+    try {
+      this.db.run('DELETE FROM users WHERE id = ?;', [userId]);
+      if (username) {
+        this.db.run('DELETE FROM users WHERE LOWER(username) = LOWER(?);', [username]);
+      }
+      this.db.run('DELETE FROM sessions WHERE user_id = ?;', [userId]);
+      this.db.run('DELETE FROM conversation_members WHERE user_id = ?;', [userId]);
+      this.db.run('DELETE FROM messages WHERE sender_id = ?;', [userId]);
+      this.db.run('DELETE FROM stories WHERE user_id = ?;', [userId]);
+      this.db.run('DELETE FROM calls WHERE caller_id = ? OR receiver_id = ?;', [userId, userId]);
+      this.save();
+    } catch (err) {
+      console.error('Failed to delete user from SQLite:', err);
+    }
+  }
+
   public clearAllChats(): void {
     if (!this.db) return;
     this.db.run(`

@@ -14,8 +14,10 @@ import {
   CheckCheck,
   Trash2,
   X,
+  Shield,
 } from 'lucide-react';
 import { Conversation, User, Story } from '../../types';
+import { isSuperAdminUser } from '../../lib/api';
 
 interface SidebarProps {
   currentUser: User;
@@ -48,6 +50,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onStartDirectChat,
   onOpenNewConversation,
   onOpenSettings,
+  onOpenAdmin,
   onLogout,
   onOpenCommandPalette,
   onOpenCallsHistory,
@@ -233,6 +236,16 @@ export const Sidebar: React.FC<SidebarProps> = ({
         >
           <SettingsIcon className="w-4 h-4" />
         </button>
+
+        {isSuperAdminUser(currentUser) && (
+          <button
+            onClick={onOpenAdmin}
+            title="Superadmin Data & User Control (nihal.graphix)"
+            className="w-9 h-9 rounded-xl bg-white/10 border border-white/30 hover:bg-white hover:text-black text-white flex items-center justify-center transition shrink-0 cursor-pointer active:scale-95"
+          >
+            <Shield className="w-4 h-4" />
+          </button>
+        )}
       </div>
 
       {/* Category Tabs: All, Direct, Groups, Saved */}
@@ -506,6 +519,17 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 >
                   <SettingsIcon className="w-4 h-4" />
                   <span>Settings & Profile</span>
+                </button>
+
+                <button
+                  onClick={() => {
+                    setShowProfileMenu(false);
+                    onOpenAdmin();
+                  }}
+                  className="w-full px-3 py-2 rounded-xl text-xs font-medium text-neutral-200 hover:bg-white hover:text-black flex items-center gap-2.5 transition cursor-pointer"
+                >
+                  <Shield className="w-4 h-4" />
+                  <span>Admin Data & Users</span>
                 </button>
 
                 {onOpenCommandPalette && (

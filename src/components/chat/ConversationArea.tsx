@@ -465,39 +465,30 @@ export const ConversationArea: React.FC<ConversationAreaProps> = ({
     }
   };
 
-  // Stop and Send Voice Note (with transcription attached)
+  // Stop and Send Voice Note immediately
   const handleSendVoice = async () => {
     setIsTranscribingInput(true);
-    const recorded = await voiceRecorder.stopRecording();
-    if (recorded && recorded.audioDataUrl) {
-      audioEffects.playMessageSent();
-      let transcriptText = recorded.liveTranscript ? recorded.liveTranscript.trim() : '';
+    try {
+      const recorded = await voiceRecorder.stopRecording();
+      if (recorded && recorded.audioDataUrl) {
+        audioEffects.playMessageSent();
+        const transcriptText = recorded.liveTranscript ? recorded.liveTranscript.trim() : '';
 
-      // If live transcription is empty, run server AI transcription
-      if (!transcriptText) {
-        try {
-          const aiRes = await api.transcribeAudio({
-            audioData: recorded.audioDataUrl,
-          });
-          if (aiRes.transcription) {
-            transcriptText = aiRes.transcription.trim();
-          }
-        } catch (e) {
-          console.warn('Voice note transcription note:', e);
-        }
+        onSendMessage({
+          type: 'voice',
+          content: transcriptText ? `Voice note: "${transcriptText}"` : 'Voice message',
+          mediaUrl: recorded.audioDataUrl,
+          duration: recorded.duration,
+          voiceDuration: recorded.duration,
+          fileName: `voice_${Math.max(1, Math.round(recorded.duration))}s.webm`,
+          transcription: transcriptText || undefined,
+          replyToId: replyingTo?.id,
+        });
+        setReplyingTo(null);
       }
-
-      onSendMessage({
-        type: 'voice',
-        content: transcriptText ? `Voice note: "${transcriptText}"` : 'Voice note',
-        mediaUrl: recorded.audioDataUrl,
-        voiceDuration: recorded.duration,
-        transcription: transcriptText || undefined,
-        replyToId: replyingTo?.id,
-      });
-      setReplyingTo(null);
+    } finally {
+      setIsTranscribingInput(false);
     }
-    setIsTranscribingInput(false);
   };
 
   // Convert Voice Recording to Text and insert directly into input field
@@ -1315,11 +1306,20 @@ export const ConversationArea: React.FC<ConversationAreaProps> = ({
 
         {/* Message stream */}
         {filteredMessages.map((msg, index) => {
+          const normKey = (s?: string) =>
+            (s || '').trim().toLowerCase().replace(/^@/, '').replace(/[^a-z0-9_]/g, '_');
+          const myUsernameKey = normKey(currentUser.username);
+          const myEmailKey = currentUser.email ? normKey(currentUser.email.split('@')[0]) : '';
+          const msgSenderIdKey = normKey(msg.senderId);
+          const msgSenderUserKey = normKey(msg.sender?.username);
+
           const isMe =
             msg.senderId === currentUser.id ||
-            (Boolean(currentUser.username) &&
-              (msg.senderId.toLowerCase() === currentUser.username.toLowerCase() ||
-                msg.sender?.username?.toLowerCase() === currentUser.username.toLowerCase()));
+            msg.sender?.id === currentUser.id ||
+            (Boolean(myUsernameKey) &&
+              (msgSenderIdKey === myUsernameKey || msgSenderUserKey === myUsernameKey)) ||
+            (Boolean(myEmailKey) &&
+              (msgSenderIdKey === myEmailKey || msgSenderUserKey === myEmailKey));
           const showDateHeader =
             index === 0 ||
             new Date(msg.createdAt).toDateString() !==

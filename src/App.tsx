@@ -24,6 +24,9 @@ import { api } from './lib/api';
 import {
   subscribeToConversationsFromFirestore,
   subscribeToMessagesFromFirestore,
+  subscribeToStoriesFromFirestore,
+  isUserDeletedInCloudCache,
+  parseDirectConversationParticipants,
 } from './lib/firebase';
 import { User, Conversation, Message, Story, Call, AccentTheme } from './types';
 import { Sparkles, MessageSquare, Shield, Bell } from 'lucide-react';
@@ -111,12 +114,31 @@ export default function App() {
 
   const isSameUserIdentity = useCallback((uA?: Partial<User> | string | null, uB?: Partial<User> | string | null): boolean => {
     if (!uA || !uB) return false;
-    const idA = typeof uA === 'string' ? uA : uA.id || '';
-    const idB = typeof uB === 'string' ? uB : uB.id || '';
-    if (idA && idB && idA === idB) return true;
-    const nameA = (typeof uA === 'string' ? uA : uA.username || '').trim().toLowerCase().replace(/^@/, '');
-    const nameB = (typeof uB === 'string' ? uB : uB.username || '').trim().toLowerCase().replace(/^@/, '');
-    return Boolean(nameA && nameB && nameA === nameB);
+    const norm = (s: string) => s.trim().toLowerCase().replace(/^@/, '').replace(/[^a-z0-9_]/g, '_');
+    const idA = typeof uA === 'string' ? uA.trim() : (uA.id || '').trim();
+    const idB = typeof uB === 'string' ? uB.trim() : (uB.id || '').trim();
+    if (idA && idB && (idA === idB || idA.toLowerCase() === idB.toLowerCase())) return true;
+
+    const keysA = new Set<string>();
+    const keysB = new Set<string>();
+    if (typeof uA === 'string') {
+      keysA.add(norm(uA));
+    } else {
+      if (uA.username) keysA.add(norm(uA.username));
+      if (uA.email) keysA.add(norm(uA.email.split('@')[0]));
+      if (uA.id && !uA.id.startsWith('u_')) keysA.add(norm(uA.id));
+    }
+    if (typeof uB === 'string') {
+      keysB.add(norm(uB));
+    } else {
+      if (uB.username) keysB.add(norm(uB.username));
+      if (uB.email) keysB.add(norm(uB.email.split('@')[0]));
+      if (uB.id && !uB.id.startsWith('u_')) keysB.add(norm(uB.id));
+    }
+    for (const k of keysA) {
+      if (k && keysB.has(k)) return true;
+    }
+    return false;
   }, []);
 
   // WebSocket Event Handlers
@@ -486,6 +508,7 @@ export default function App() {
               email: stored.email,
               displayName: stored.displayName,
               avatarUrl: stored.avatarUrl,
+              isSessionRecovery: true,
             });
             setCurrentUser(res.user);
           } catch {
@@ -525,7 +548,16 @@ export default function App() {
 
   useEffect(() => {
     loadConversationsAndStories();
-  }, [loadConversationsAndStories]);
+    if (currentUser) {
+      api
+        .getSettings()
+        .then(s => {
+          if (s?.theme) setTheme(s.theme);
+          if (s?.accent) setAccent(s.accent);
+        })
+        .catch(() => {});
+    }
+  }, [loadConversationsAndStories, currentUser]);
 
   // Load messages when active conversation changes
   useEffect(() => {
@@ -609,8 +641,24 @@ export default function App() {
       }
     );
 
+    const unsubStories = subscribeToStoriesFromFirestore(cloudStories => {
+      if (!cloudStories) return;
+      setStories(prev => {
+        const byId = new Map<string, Story>();
+        for (const s of [...prev, ...cloudStories]) {
+          if (s && s.id && !isUserDeletedInCloudCache(s.user || s.userId)) {
+            byId.set(s.id, s);
+          }
+        }
+        return Array.from(byId.values()).sort(
+          (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+        );
+      });
+    });
+
     return () => {
       unsubConvs();
+      unsubStories();
     };
   }, [currentUser, contactsList]);
 
@@ -648,7 +696,26 @@ export default function App() {
         const convs = await api.getConversations();
         if (!isMounted) return;
         const nonChannel = convs.filter(c => c.type !== 'channel');
-        setConversations(nonChannel);
+        setConversations(prev => {
+          const map = new Map<string, Conversation>();
+          for (const c of prev) map.set(c.id, c);
+          for (const c of nonChannel) {
+            const existing = map.get(c.id);
+            map.set(c.id, {
+              ...(existing || {}),
+              ...c,
+              members: c.members?.length ? c.members : existing?.members || [],
+              lastMessage: c.lastMessage || existing?.lastMessage,
+            });
+          }
+          return Array.from(map.values()).sort((a, b) => {
+            if (a.isPinned && !b.isPinned) return -1;
+            if (!a.isPinned && b.isPinned) return 1;
+            const timeA = a.lastMessage?.createdAt || a.createdAt;
+            const timeB = b.lastMessage?.createdAt || b.createdAt;
+            return new Date(timeB).getTime() - new Date(timeA).getTime();
+          });
+        });
 
         const activeId = activeConversationIdRef.current;
         if (activeId) {
@@ -741,10 +808,14 @@ export default function App() {
 
         const current = activeCallRef.current;
         if (serverCall) {
+          const isCallerMe = isSameUserIdentity(
+            serverCall.caller || serverCall.callerId,
+            currentUser
+          );
           if (!current || current.id !== serverCall.id) {
             setIncomingCallSignals([]);
             setActiveCall(serverCall);
-            setIsIncomingCall(serverCall.callerId !== currentUser.id && serverCall.status !== 'active');
+            setIsIncomingCall(!isCallerMe && serverCall.status !== 'active');
           } else if (current.status !== serverCall.status || current.type !== serverCall.type) {
             setActiveCall(serverCall);
             if (serverCall.status === 'active') {
@@ -767,15 +838,34 @@ export default function App() {
       isMounted = false;
       clearInterval(timer);
     };
-  }, [currentUser, activeCall?.id, activeCall?.status]);
+  }, [currentUser, activeCall?.id, activeCall?.status, isSameUserIdentity]);
 
   const handleStartCall = async (type: 'voice' | 'video') => {
     if (!activeConversationId || !currentUser) return;
     const conv = conversations.find(c => c.id === activeConversationId);
     if (!conv) return;
 
-    const otherMember = conv.members.find(m => m.userId !== currentUser.id);
-    const receiverId = otherMember?.userId || contactsList.find(u => u.id !== currentUser.id)?.id;
+    const otherMember = conv.members.find(
+      m => !isSameUserIdentity(m.user || m.userId, currentUser)
+    );
+    let receiverUser = otherMember?.user;
+    let receiverId = otherMember?.userId || otherMember?.user?.id;
+
+    if (!receiverId && conv.id.startsWith('c_dm_')) {
+      const dmParts = conv.id.slice('c_dm_'.length).split('__').filter(Boolean);
+      const otherDmPart = dmParts.find(p => !isSameUserIdentity(p, currentUser));
+      if (otherDmPart) {
+        const matchedContact = contactsList.find(u => isSameUserIdentity(u, otherDmPart));
+        receiverUser = matchedContact;
+        receiverId = matchedContact?.id || otherDmPart;
+      }
+    }
+
+    if (!receiverId) {
+      const fallbackContact = contactsList.find(u => !isSameUserIdentity(u, currentUser));
+      receiverUser = fallbackContact;
+      receiverId = fallbackContact?.id;
+    }
 
     if (!receiverId) {
       addToast({
@@ -790,6 +880,7 @@ export default function App() {
       setIncomingCallSignals([]);
       const call = await api.initiateCall({
         receiverId,
+        receiverUser,
         conversationId: activeConversationId,
         type,
       });
@@ -931,7 +1022,9 @@ export default function App() {
           type: 'direct',
           name: targetUser.displayName,
           avatarUrl: targetUser.avatarUrl,
+          username: targetUser.username,
           memberIds: [targetUser.id],
+          memberUsers: [targetUser],
         });
         await loadConversationsAndStories();
         setActiveConversationId(conv.id);
@@ -1018,19 +1111,96 @@ export default function App() {
     addToast({ type: 'info', message: 'Signed out of Aether' });
   };
 
+  const handleClearChatsOnly = async () => {
+    try {
+      await api.clearAllChatsOnly();
+      setConversations([]);
+      setMessages([]);
+      setStories([]);
+      setCallsList([]);
+      setActiveConversationId(null);
+      addToast({
+        type: 'success',
+        title: 'Chat Data Cleared',
+        message: 'All conversations, messages, stories, and call logs have been cleared.',
+      });
+    } catch (err) {
+      console.error('Failed to clear chat data', err);
+      addToast({
+        type: 'error',
+        title: 'Clear Failed',
+        message: 'Could not clear chat data.',
+      });
+    }
+  };
+
+  const handleUserDeleted = (deletedUserId: string) => {
+    setContactsList(prev =>
+      prev.filter(u => u.id !== deletedUserId && !isUserDeletedInCloudCache(u))
+    );
+    setConversations(prev => {
+      const remaining = prev.filter(c => {
+        if (c.type === 'direct') {
+          const memberMatch = (c.members || []).some(
+            m =>
+              m.userId === deletedUserId ||
+              m.user?.id === deletedUserId ||
+              (!isSameUserIdentity(m.user || m.userId, currentUser) &&
+                isUserDeletedInCloudCache(m.user || m.userId))
+          );
+          const dmPartMatch = parseDirectConversationParticipants(c.id).some(
+            p => !isSameUserIdentity(p, currentUser) && isUserDeletedInCloudCache(p)
+          );
+          return !memberMatch && !dmPartMatch;
+        }
+        return true;
+      });
+      if (
+        activeConversationIdRef.current &&
+        !remaining.some(c => c.id === activeConversationIdRef.current)
+      ) {
+        setActiveConversationId(remaining.length > 0 ? remaining[0].id : null);
+        setMessages([]);
+        setShowInfoPanel(false);
+      }
+      return remaining;
+    });
+    setStories(prev =>
+      prev.filter(
+        s => s.userId !== deletedUserId && !isUserDeletedInCloudCache(s.user || s.userId)
+      )
+    );
+    setCallsList(prev =>
+      prev.filter(
+        c =>
+          c.callerId !== deletedUserId &&
+          c.receiverId !== deletedUserId &&
+          !isUserDeletedInCloudCache(c.caller || c.callerId) &&
+          !isUserDeletedInCloudCache(c.receiver || c.receiverId)
+      )
+    );
+    addToast({
+      type: 'info',
+      title: 'User Deleted',
+      message: 'User account and associated direct chats removed.',
+    });
+  };
+
   const handleResetAllData = async () => {
     try {
       await api.resetAllData();
       setConversations([]);
       setMessages([]);
       setStories([]);
+      setContactsList([]);
+      setCallsList([]);
       setActiveConversationId(null);
+      setCurrentUser(null);
       addToast({
         type: 'success',
         title: 'Workspace Reset',
-        message: 'All data has been removed and reset to new.',
+        message: 'All chat and user data has been removed and reset to new.',
       });
-      await loadConversationsAndStories();
     } catch (err) {
       console.error('Failed to reset all data', err);
       addToast({
@@ -1115,6 +1285,9 @@ export default function App() {
               onClearConversation={handleClearConversationMessages}
               onDeleteAllConversations={handleDeleteAllConversations}
               onClearAllConversations={handleClearAllConversations}
+              onResetAllData={handleResetAllData}
+              onClearChatsOnly={handleClearChatsOnly}
+              onUserDeleted={handleUserDeleted}
               onLogout={handleLogout}
             />
           ) : (
@@ -1309,6 +1482,8 @@ export default function App() {
           currentUser={currentUser}
           onClose={() => setIsAdminOpen(false)}
           onResetAllData={handleResetAllData}
+          onClearChatsOnly={handleClearChatsOnly}
+          onUserDeleted={handleUserDeleted}
         />
       )}
 

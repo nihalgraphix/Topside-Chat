@@ -70,6 +70,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
   const [isSaving, setIsSaving] = useState(false);
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
+  const [confirmReset, setConfirmReset] = useState(false);
 
   const testVideoRef = useRef<HTMLVideoElement | null>(null);
   const testStreamRef = useRef<MediaStream | null>(null);
@@ -689,21 +690,33 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     </div>
                   </div>
                   {onResetAllData && (
-                    <button
-                      onClick={() => {
-                        if (
-                          window.confirm(
-                            'Are you sure you want to reset all data? This will clear local records and reset default conversations.'
-                          )
-                        ) {
-                          onResetAllData();
-                          onClose();
-                        }
-                      }}
-                      className="px-3 py-1.5 rounded-xl bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 text-xs font-semibold border border-rose-500/30 transition cursor-pointer shrink-0"
-                    >
-                      Reset All Data
-                    </button>
+                    confirmReset ? (
+                      <div className="flex items-center gap-2 shrink-0">
+                        <button
+                          onClick={() => {
+                            setConfirmReset(false);
+                            onResetAllData();
+                            onClose();
+                          }}
+                          className="px-3 py-1.5 rounded-xl bg-rose-500 text-white text-xs font-bold hover:bg-rose-600 transition cursor-pointer"
+                        >
+                          Confirm Reset
+                        </button>
+                        <button
+                          onClick={() => setConfirmReset(false)}
+                          className="px-3 py-1.5 rounded-xl bg-white/10 text-slate-300 text-xs hover:text-white transition cursor-pointer"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        onClick={() => setConfirmReset(true)}
+                        className="px-3 py-1.5 rounded-xl bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 text-xs font-semibold border border-rose-500/30 transition cursor-pointer shrink-0"
+                      >
+                        Reset All Data
+                      </button>
+                    )
                   )}
                 </div>
               </div>

@@ -8,6 +8,7 @@ import {
 } from 'firebase/auth';
 import {
   getFirestore,
+  setLogLevel,
   doc,
   getDoc,
   setDoc,
@@ -36,6 +37,8 @@ import {
   UserSettings,
 } from '../src/types';
 
+setLogLevel('silent');
+
 const serverFirebaseApp =
   getApps().find(a => a.name === 'aether-server-sync') ||
   initializeApp(firebaseConfig, 'aether-server-sync');
@@ -54,6 +57,7 @@ interface DatabaseSchema {
   reports: Report[];
   blockedUsers: BlockedUser[];
   userSettings: Record<string, UserSettings>;
+  purgedUserIds?: string[];
 }
 
 const DATA_DIR = path.join(process.cwd(), 'data');
@@ -75,12 +79,30 @@ export const PURGED_USER_IDS = new Set([
   'u_admin',
   'u_bot',
   'u_1789118066028_c7hyx',
-  'u_1793542551003_u6d1q',
-  'u_1793542529768_2hell',
-  'u_g_1789118321867_ri6j',
-  'u_1793542689808_tgcbq',
-  'u_1793542584643_kbekr',
 ]);
+
+export function isSuperAdminIdentity(userOrStr?: Partial<User> | string | null): boolean {
+  if (!userOrStr) return false;
+  if (typeof userOrStr === 'string') {
+    const clean = userOrStr.trim().toLowerCase().replace(/^@/, '');
+    const norm = clean.replace(/[^a-z0-9_]/g, '_');
+    return (
+      clean === 'nihal.graphix' ||
+      clean === 'nihal_graphix' ||
+      clean === 'nihalgraphix' ||
+      norm === 'nihal_graphix' ||
+      clean === 'nihal.graphix@gmail.com' ||
+      clean.startsWith('nihal.graphix@') ||
+      clean.startsWith('nihal_graphix@') ||
+      clean.startsWith('nihalgraphix@')
+    );
+  }
+  return (
+    userOrStr.role === 'superadmin' ||
+    isSuperAdminIdentity(userOrStr.username) ||
+    isSuperAdminIdentity(userOrStr.email)
+  );
+}
 
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -116,14 +138,252 @@ class AetherDatabase {
         await this.publishUserToCloud(u);
       }
       await this.pullUsersFromCloud(true);
+      for (const c of this.data.conversations) {
+        await this.publishConversationToCloud(c);
+      }
+      for (const m of this.data.messages) {
+        await this.publishMessageToCloud(m);
+      }
+      for (const s of this.data.stories) {
+        await this.publishStoryToCloud(s);
+      }
     } catch {
       // Non-blocking startup cloud sync
     }
   }
 
+  private toCloudUsernameKey(raw?: string): string {
+    if (!raw) return '';
+    return raw
+      .trim()
+      .toLowerCase()
+      .replace(/^@/, '')
+      .replace(/[^a-z0-9_]/g, '_')
+      .slice(0, 32);
+  }
+
+  public async publishConversationToCloud(conv: Conversation): Promise<void> {
+    if (!conv || !conv.id) return;
+    try {
+      const members = this.data.conversationMembers.filter(m => m.conversationId === conv.id);
+      const memberKeys = Array.from(
+        new Set(
+          members
+            .map(m => {
+              const u = this.getUserById(m.userId);
+              return this.toCloudUsernameKey(u?.username || m.userId);
+            })
+            .filter(k => k.length >= 2 && !this.isUserPurged(k))
+        )
+      ).slice(0, 20);
+      if (memberKeys.length === 0) return;
+
+      const cleanConvId = conv.id.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 120);
+      const convType = conv.type === 'group' ? 'group' : 'direct';
+      const convName = (conv.name || 'Chat').trim().slice(0, 80) || 'Chat';
+      const convAvatar = (
+        conv.avatarUrl || `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(convName)}`
+      ).slice(0, 2048);
+      const lastMsg = (conv.lastMessage?.content || '').slice(0, 500);
+      const lastSender = (conv.lastMessage?.senderId || conv.createdBy || memberKeys[0]).slice(0, 128);
+
+      for (const ownerKey of memberKeys) {
+        const ownerUser = this.getUserByUsername(ownerKey);
+        if (ownerUser) {
+          await this.publishUserToCloud(ownerUser);
+        }
+        const convRef = doc(serverFirestore, 'users', ownerKey, 'conversations', cleanConvId);
+        const snap = await getDoc(convRef);
+        if (!snap.exists()) {
+          await setDoc(convRef, {
+            convId: cleanConvId,
+            ownerId: ownerKey,
+            type: convType,
+            name: convName,
+            avatarUrl: convAvatar,
+            lastMessageText: lastMsg,
+            lastSenderId: lastSender,
+            memberIds: memberKeys,
+            isPinned: false,
+            isMuted: false,
+            unreadCount: 0,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+        } else {
+          await updateDoc(convRef, {
+            name: convName,
+            avatarUrl: convAvatar,
+            lastMessageText: lastMsg,
+            lastSenderId: lastSender,
+            memberIds: memberKeys,
+            updatedAt: serverTimestamp(),
+          });
+        }
+      }
+    } catch {
+      // Ignore transient Firestore error
+    }
+  }
+
+  public async publishMessageToCloud(msg: Message): Promise<void> {
+    if (!msg || !msg.id || !msg.conversationId) return;
+    try {
+      const members = this.data.conversationMembers.filter(m => m.conversationId === msg.conversationId);
+      const senderUser = this.getUserById(msg.senderId);
+      const senderKey = this.toCloudUsernameKey(senderUser?.username || msg.senderId) || 'user';
+      if (this.isUserPurged(senderKey)) return;
+
+      const ownerKeys = new Set<string>([senderKey]);
+      for (const m of members) {
+        const u = this.getUserById(m.userId);
+        const k = this.toCloudUsernameKey(u?.username || m.userId);
+        if (k && !this.isUserPurged(k)) ownerKeys.add(k);
+      }
+
+      const cleanMsgId = msg.id.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 120);
+      const cleanConvId = msg.conversationId.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 120);
+      const allowedTypes = new Set(['text', 'image', 'file', 'voice', 'video', 'system']);
+      const msgType = allowedTypes.has(msg.type) ? msg.type : 'text';
+      const content = (msg.content || (msg.fileName ? `[Attachment: ${msg.fileName}]` : 'Attachment')).slice(0, 4000);
+      const senderName = (senderUser?.displayName || senderKey || 'User').slice(0, 64);
+      const senderAvatar = (
+        senderUser?.avatarUrl ||
+        `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(senderName)}`
+      ).slice(0, 2048);
+
+      for (const ownerKey of ownerKeys) {
+        const ownerUser = this.getUserByUsername(ownerKey);
+        if (ownerUser) {
+          await this.publishUserToCloud(ownerUser);
+        }
+        const msgRef = doc(serverFirestore, 'users', ownerKey, 'messages', cleanMsgId);
+        const snap = await getDoc(msgRef);
+        if (!snap.exists()) {
+          await setDoc(msgRef, {
+            msgId: cleanMsgId,
+            ownerId: ownerKey,
+            conversationId: cleanConvId,
+            senderId: senderKey,
+            senderName,
+            senderAvatar,
+            content,
+            type: msgType,
+            mediaUrl: typeof msg.mediaUrl === 'string' && msg.mediaUrl.length <= 700000 ? msg.mediaUrl : '',
+            fileName: (msg.fileName || '').slice(0, 256),
+            fileSize: typeof msg.fileSize === 'number' && msg.fileSize >= 0 ? Math.min(msg.fileSize, 50000000) : 0,
+            duration: typeof msg.duration === 'number' && msg.duration >= 0 ? Math.min(msg.duration, 86400) : 0,
+            replyToId: (msg.replyToId || '').slice(0, 128),
+            status: msg.status === 'read' ? 'read' : msg.status === 'delivered' ? 'delivered' : 'sent',
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+        } else {
+          await updateDoc(msgRef, {
+            content,
+            status: msg.status === 'read' ? 'read' : msg.status === 'delivered' ? 'delivered' : 'sent',
+            updatedAt: serverTimestamp(),
+          });
+        }
+      }
+    } catch {
+      // Ignore transient Firestore error
+    }
+  }
+
+  public async publishStoryToCloud(story: Story): Promise<void> {
+    if (!story || !story.id) return;
+    try {
+      const author = this.getUserById(story.userId);
+      const authorUid = this.toCloudUsernameKey(author?.username || story.userId) || 'user';
+      if (this.isUserPurged(authorUid)) return;
+      if (author) {
+        await this.publishUserToCloud(author);
+      }
+      const cleanStoryId = story.id.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 120);
+      const authorName = (author?.displayName || authorUid || 'User').slice(0, 64);
+      const authorAvatar = (
+        author?.avatarUrl ||
+        `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(authorName)}`
+      ).slice(0, 2048);
+      const storyRef = doc(serverFirestore, 'stories', cleanStoryId);
+      const snap = await getDoc(storyRef);
+      if (!snap.exists()) {
+        await setDoc(storyRef, {
+          storyId: cleanStoryId,
+          authorUid,
+          authorId: (story.userId || authorUid).slice(0, 128),
+          authorName,
+          authorAvatar,
+          type: story.type === 'image' ? 'image' : 'text',
+          text: (story.text || '').slice(0, 1000),
+          mediaUrl: typeof story.mediaUrl === 'string' && story.mediaUrl.length <= 700000 ? story.mediaUrl : '',
+          background: (story.background || '#111111').slice(0, 128),
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      }
+    } catch {
+      // Ignore transient Firestore error
+    }
+  }
+
+  public isUserPurged(userOrStr?: Partial<User> | string | null): boolean {
+    if (!userOrStr) return false;
+    if (isSuperAdminIdentity(userOrStr)) return false;
+    if (typeof userOrStr === 'string') {
+      const raw = userOrStr.trim();
+      if (!raw) return false;
+      const clean = raw.toLowerCase().replace(/^@/, '');
+      const norm = clean.replace(/[^a-z0-9_]/g, '_');
+      if (PURGED_USER_IDS.has(raw) || PURGED_USER_IDS.has(clean) || PURGED_USER_IDS.has(norm)) {
+        return true;
+      }
+      if (clean.includes('@')) {
+        const prefix = clean.split('@')[0];
+        const prefixNorm = prefix.replace(/[^a-z0-9_]/g, '_');
+        if (PURGED_USER_IDS.has(prefix) || PURGED_USER_IDS.has(prefixNorm)) {
+          return true;
+        }
+      }
+      return false;
+    }
+    return (
+      this.isUserPurged(userOrStr.id) ||
+      this.isUserPurged(userOrStr.username) ||
+      this.isUserPurged(userOrStr.email)
+    );
+  }
+
+  public unpurgeUser(userOrStr?: Partial<User> | string | null): void {
+    if (!userOrStr) return;
+    const removeKey = (str?: string) => {
+      if (!str) return;
+      const raw = str.trim();
+      const clean = raw.toLowerCase().replace(/^@/, '');
+      const norm = clean.replace(/[^a-z0-9_]/g, '_');
+      PURGED_USER_IDS.delete(raw);
+      PURGED_USER_IDS.delete(clean);
+      PURGED_USER_IDS.delete(norm);
+      if (clean.includes('@')) {
+        const prefix = clean.split('@')[0];
+        PURGED_USER_IDS.delete(prefix);
+        PURGED_USER_IDS.delete(prefix.replace(/[^a-z0-9_]/g, '_'));
+      }
+    };
+    if (typeof userOrStr === 'string') {
+      removeKey(userOrStr);
+    } else {
+      removeKey(userOrStr.id);
+      removeKey(userOrStr.username);
+      removeKey(userOrStr.email);
+    }
+    this.data.purgedUserIds = Array.from(PURGED_USER_IDS);
+  }
+
   public async publishUserToCloud(user: User): Promise<void> {
     if (!user || (!user.id && !user.username)) return;
-    if (user.id && PURGED_USER_IDS.has(user.id)) return;
+    if (this.isUserPurged(user)) return;
     try {
       let cleanUsername = (user.username || user.displayName || 'user')
         .trim()
@@ -137,7 +397,7 @@ class AetherDatabase {
       const docId = cleanUsername;
       const cleanDisplayName = (user.displayName || cleanUsername).trim().slice(0, 64) || 'User';
       const cleanAppUserId = (user.id || docId).replace(/[^a-zA-Z0-9_\-]/g, '_').slice(0, 128);
-      if (PURGED_USER_IDS.has(cleanAppUserId)) return;
+      if (this.isUserPurged(cleanAppUserId) || this.isUserPurged(cleanUsername)) return;
       const cleanAvatarUrl = (
         user.avatarUrl ||
         `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(cleanDisplayName)}`
@@ -145,20 +405,21 @@ class AetherDatabase {
       const cleanBio = (user.bio || 'Member of the encrypted communications mesh.').slice(0, 256);
 
       const userRef = doc(serverFirestore, 'users', docId);
+      const createPayload = {
+        uid: docId,
+        appUserId: cleanAppUserId,
+        username: cleanUsername,
+        displayName: cleanDisplayName,
+        avatarUrl: cleanAvatarUrl,
+        bio: cleanBio,
+        isOnline: true,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      };
       const snap = await getDoc(userRef);
 
       if (!snap.exists()) {
-        await setDoc(userRef, {
-          uid: docId,
-          appUserId: cleanAppUserId,
-          username: cleanUsername,
-          displayName: cleanDisplayName,
-          avatarUrl: cleanAvatarUrl,
-          bio: cleanBio,
-          isOnline: true,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
+        await setDoc(userRef, createPayload);
       } else {
         await updateDoc(userRef, {
           appUserId: cleanAppUserId,
@@ -195,7 +456,13 @@ class AetherDatabase {
         if (!data || !data.username || !data.displayName) return;
         if (data.username === 'directory_reader' || data.username === 'guest_viewer') return;
         const resolvedId = data.appUserId || data.uid || docSnap.id;
-        if (PURGED_USER_IDS.has(resolvedId)) return;
+        if (
+          this.isUserPurged(resolvedId) ||
+          this.isUserPurged(docSnap.id) ||
+          this.isUserPurged(String(data.username))
+        ) {
+          return;
+        }
 
         cloudUsers.push({
           id: resolvedId,
@@ -295,7 +562,17 @@ class AetherDatabase {
         const raw = fs.readFileSync(DB_FILE, 'utf-8');
         const parsed: DatabaseSchema = JSON.parse(raw);
 
-        parsed.users = (parsed.users || []).filter((u: any) => !DEMO_USER_IDS.has(u.id));
+        if (Array.isArray(parsed.purgedUserIds)) {
+          for (const pid of parsed.purgedUserIds) {
+            if (pid && !isSuperAdminIdentity(pid)) {
+              PURGED_USER_IDS.add(String(pid));
+            }
+          }
+        }
+
+        parsed.users = (parsed.users || []).filter(
+          (u: any) => !DEMO_USER_IDS.has(u.id) && !DEMO_USER_IDS.has((u.username || '').toLowerCase())
+        );
         parsed.sessions = (parsed.sessions || []).filter((s: any) => !DEMO_USER_IDS.has(s.userId));
         const convById = new Map<string, Conversation>();
         for (const c of parsed.conversations || []) {
@@ -335,6 +612,7 @@ class AetherDatabase {
             delete parsed.userSettings[id];
           }
         }
+        parsed.purgedUserIds = Array.from(PURGED_USER_IDS);
         return parsed;
       }
     } catch (err) {
@@ -353,11 +631,13 @@ class AetherDatabase {
       reports: [],
       blockedUsers: [],
       userSettings: {},
+      purgedUserIds: Array.from(PURGED_USER_IDS),
     };
   }
 
   public saveSync(): void {
     try {
+      this.data.purgedUserIds = Array.from(PURGED_USER_IDS);
       fs.writeFileSync(DB_FILE, JSON.stringify(this.data, null, 2), 'utf-8');
     } catch (err) {
       console.error('Failed to write database file', err);
@@ -375,39 +655,21 @@ class AetherDatabase {
   }
 
   public async purgeAllData(): Promise<void> {
-    const knownUserDocIds = new Set<string>();
-    for (const u of this.data.users) {
-      if (u.username) {
-        const cleanU = u.username.trim().toLowerCase().replace(/^@/, '').replace(/[^a-z0-9_]/g, '_').slice(0, 32);
-        if (cleanU) knownUserDocIds.add(cleanU);
-      }
-      if (u.id) {
-        const cleanId = u.id.trim().replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 120);
-        if (cleanId) knownUserDocIds.add(cleanId);
-      }
-    }
-
     this.clearAllData();
 
+    const existingUserDocIds = new Set<string>();
     try {
       const usersSnap = await getDocs(
         query(collection(serverFirestore, 'users'), limit(100))
       );
       usersSnap.forEach(d => {
-        knownUserDocIds.add(d.id);
-        const data = d.data();
-        if (data?.appUserId) {
-          knownUserDocIds.add(String(data.appUserId).replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 120));
-        }
-        if (data?.uid) {
-          knownUserDocIds.add(String(data.uid).replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 120));
-        }
+        existingUserDocIds.add(d.id);
       });
     } catch {
       // Ignore query error
     }
 
-    for (const uid of knownUserDocIds) {
+    for (const uid of existingUserDocIds) {
       const subcollections = ['conversations', 'messages', 'files', 'notes'];
       for (const sub of subcollections) {
         try {
@@ -445,9 +707,332 @@ class AetherDatabase {
     void this.purgeAllData();
   }
 
+  public async clearAllChatsOnly(): Promise<void> {
+    this.data.conversations = [];
+    this.data.conversationMembers = [];
+    this.data.messages = [];
+    this.data.stories = [];
+    this.data.calls = [];
+    try {
+      sqlStorage.clearAllChats();
+    } catch {
+      // Ignore SQLite error
+    }
+    this.saveSync();
+
+    const existingUserDocIds = new Set<string>();
+    try {
+      const usersSnap = await getDocs(query(collection(serverFirestore, 'users'), limit(100)));
+      usersSnap.forEach(d => {
+        existingUserDocIds.add(d.id);
+      });
+    } catch {
+      // Ignore
+    }
+
+    for (const uid of existingUserDocIds) {
+      for (const sub of ['conversations', 'messages', 'files']) {
+        try {
+          const subSnap = await getDocs(query(collection(serverFirestore, 'users', uid, sub), limit(200)));
+          for (const subDoc of subSnap.docs) {
+            await deleteDoc(doc(serverFirestore, 'users', uid, sub, subDoc.id)).catch(() => {});
+          }
+        } catch {
+          // Ignore
+        }
+      }
+    }
+
+    try {
+      const storiesSnap = await getDocs(query(collection(serverFirestore, 'stories'), limit(100)));
+      for (const sDoc of storiesSnap.docs) {
+        await deleteDoc(doc(serverFirestore, 'stories', sDoc.id)).catch(() => {});
+      }
+    } catch {
+      // Ignore
+    }
+  }
+
+  public async deleteUserAccount(targetIdOrUsername: string, extraUser?: Partial<User>): Promise<string[]> {
+    if (!targetIdOrUsername && !extraUser) return [];
+    const raw = (targetIdOrUsername || extraUser?.id || extraUser?.username || '').trim();
+    if (!raw || isSuperAdminIdentity(raw) || isSuperAdminIdentity(extraUser)) return [];
+    const clean = raw.toLowerCase().replace(/^@/, '');
+    const norm = clean.replace(/[^a-z0-9_]/g, '_');
+
+    const matchedUsers = this.data.users.filter(
+      u =>
+        !isSuperAdminIdentity(u) &&
+        (u.id === raw ||
+          u.username.toLowerCase() === clean ||
+          u.username.toLowerCase() === norm ||
+          (u.email && u.email.toLowerCase() === clean) ||
+          (extraUser?.id && u.id === extraUser.id) ||
+          (extraUser?.username && u.username.toLowerCase() === extraUser.username.trim().toLowerCase()) ||
+          (extraUser?.email && u.email && u.email.toLowerCase() === extraUser.email.trim().toLowerCase()))
+    );
+
+    const candidateDocIds = new Set<string>();
+    const purgedKeys = new Set<string>();
+    const addPurgeKey = (val?: string) => {
+      if (!val || isSuperAdminIdentity(val)) return;
+      const t = val.trim();
+      if (!t) return;
+      const c = t.toLowerCase().replace(/^@/, '');
+      const n = c.replace(/[^a-z0-9_]/g, '_');
+      PURGED_USER_IDS.add(t);
+      PURGED_USER_IDS.add(c);
+      if (n) {
+        PURGED_USER_IDS.add(n);
+        candidateDocIds.add(n.slice(0, 32));
+      }
+      candidateDocIds.add(t.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 120));
+      purgedKeys.add(t);
+      purgedKeys.add(c);
+      if (n) purgedKeys.add(n);
+      if (c.includes('@')) {
+        const prefix = c.split('@')[0];
+        const prefixNorm = prefix.replace(/[^a-z0-9_]/g, '_');
+        if (prefix) {
+          PURGED_USER_IDS.add(prefix);
+          purgedKeys.add(prefix);
+        }
+        if (prefixNorm) {
+          PURGED_USER_IDS.add(prefixNorm);
+          candidateDocIds.add(prefixNorm.slice(0, 32));
+          purgedKeys.add(prefixNorm);
+        }
+      }
+    };
+
+    addPurgeKey(raw);
+    if (extraUser) {
+      addPurgeKey(extraUser.id);
+      addPurgeKey(extraUser.username);
+      addPurgeKey(extraUser.email);
+    }
+
+    for (const u of matchedUsers) {
+      addPurgeKey(u.id);
+      addPurgeKey(u.username);
+      addPurgeKey(u.email);
+      try {
+        sqlStorage.deleteUser(u.id, u.username);
+      } catch {
+        // Ignore
+      }
+      delete this.data.userSettings[u.id];
+    }
+
+    try {
+      sqlStorage.deleteUser(raw, norm);
+    } catch {
+      // Ignore
+    }
+
+    const removedUserIds = new Set<string>([
+      raw,
+      clean,
+      norm,
+      ...(extraUser?.id ? [extraUser.id] : []),
+      ...matchedUsers.map(u => u.id),
+    ]);
+
+    this.data.users = this.data.users.filter(
+      u =>
+        isSuperAdminIdentity(u) ||
+        (!removedUserIds.has(u.id) &&
+          u.username.toLowerCase() !== clean &&
+          u.username.toLowerCase() !== norm &&
+          !this.isUserPurged(u))
+    );
+    this.data.sessions = this.data.sessions.filter(s => !removedUserIds.has(s.userId));
+    this.data.blockedUsers = this.data.blockedUsers.filter(
+      b => !removedUserIds.has(b.userId) && !removedUserIds.has(b.blockedUserId)
+    );
+    this.data.reports = this.data.reports.filter(
+      r => !removedUserIds.has(r.reporterId) && !removedUserIds.has(r.reportedUserId || '')
+    );
+
+    // Find direct conversations involving the deleted user
+    const directConvIdsToDelete = new Set<string>();
+    for (const m of this.data.conversationMembers) {
+      if (removedUserIds.has(m.userId) || purgedKeys.has(m.userId.toLowerCase())) {
+        const conv = this.data.conversations.find(c => c.id === m.conversationId);
+        if (conv && conv.type === 'direct') {
+          directConvIdsToDelete.add(conv.id);
+        }
+      }
+    }
+    for (const c of this.data.conversations) {
+      if (c.type === 'direct') {
+        const lowerId = c.id.toLowerCase();
+        if (
+          (norm && lowerId.includes(norm)) ||
+          Array.from(candidateDocIds).some(k => k.length >= 3 && lowerId.includes(k.toLowerCase()))
+        ) {
+          directConvIdsToDelete.add(c.id);
+        }
+      }
+    }
+
+    this.data.conversationMembers = this.data.conversationMembers.filter(
+      m =>
+        !removedUserIds.has(m.userId) &&
+        !purgedKeys.has(m.userId.toLowerCase()) &&
+        !directConvIdsToDelete.has(m.conversationId)
+    );
+    this.data.conversations = this.data.conversations.filter(c => !directConvIdsToDelete.has(c.id));
+    this.data.messages = this.data.messages.filter(
+      m =>
+        !removedUserIds.has(m.senderId) &&
+        !purgedKeys.has(m.senderId.toLowerCase()) &&
+        !directConvIdsToDelete.has(m.conversationId)
+    );
+    this.data.stories = this.data.stories.filter(
+      s => !removedUserIds.has(s.userId) && !purgedKeys.has(s.userId.toLowerCase())
+    );
+    this.data.calls = this.data.calls.filter(
+      c =>
+        !removedUserIds.has(c.callerId) &&
+        !removedUserIds.has(c.receiverId || '') &&
+        !purgedKeys.has(c.callerId.toLowerCase()) &&
+        !purgedKeys.has((c.receiverId || '').toLowerCase())
+    );
+
+    this.saveSync();
+
+    // Delete from Firestore (both the target user's docs AND direct conversations in other users' subcollections)
+    const existingDocIdsToDelete = new Set<string>();
+    const otherDocIds = new Set<string>();
+    try {
+      const snap = await getDocs(query(collection(serverFirestore, 'users'), limit(100)));
+      snap.forEach(d => {
+        const data = d.data();
+        const docAppUserId = data?.appUserId
+          ? String(data.appUserId).replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 120)
+          : '';
+        const docUsername = data?.username
+          ? String(data.username).trim().toLowerCase().replace(/^@/, '').replace(/[^a-z0-9_]/g, '_').slice(0, 32)
+          : '';
+        if (
+          candidateDocIds.has(d.id) ||
+          (docAppUserId && candidateDocIds.has(docAppUserId)) ||
+          (docUsername && candidateDocIds.has(docUsername))
+        ) {
+          existingDocIdsToDelete.add(d.id);
+          if (docAppUserId) candidateDocIds.add(docAppUserId);
+          if (docUsername) candidateDocIds.add(docUsername);
+        } else {
+          otherDocIds.add(d.id);
+        }
+      });
+    } catch {
+      for (const docId of candidateDocIds) {
+        if (!docId) continue;
+        try {
+          const docSnap = await getDoc(doc(serverFirestore, 'users', docId));
+          if (docSnap.exists()) {
+            existingDocIdsToDelete.add(docId);
+          }
+        } catch {
+          // Ignore
+        }
+      }
+    }
+
+    for (const docId of existingDocIdsToDelete) {
+      for (const sub of ['conversations', 'messages', 'files', 'notes']) {
+        try {
+          const subSnap = await getDocs(query(collection(serverFirestore, 'users', docId, sub), limit(200)));
+          for (const subDoc of subSnap.docs) {
+            await deleteDoc(doc(serverFirestore, 'users', docId, sub, subDoc.id)).catch(() => {});
+          }
+        } catch {
+          // Ignore
+        }
+      }
+      try {
+        await deleteDoc(doc(serverFirestore, 'users', docId)).catch(() => {});
+      } catch {
+        // Ignore
+      }
+    }
+
+    // Also remove direct conversations and messages involving the deleted user from other users' Firestore collections
+    for (const otherUid of otherDocIds) {
+      try {
+        const convSnap = await getDocs(
+          query(collection(serverFirestore, 'users', otherUid, 'conversations'), limit(100))
+        );
+        for (const cDoc of convSnap.docs) {
+          const cData = cDoc.data();
+          const convId = String(cData?.convId || cDoc.id);
+          const memberIds: string[] = Array.isArray(cData?.memberIds) ? cData.memberIds.map(String) : [];
+          const involvesDeleted =
+            memberIds.some(m => candidateDocIds.has(m) || purgedKeys.has(m.toLowerCase())) ||
+            Array.from(candidateDocIds).some(
+              k => k.length >= 3 && convId.toLowerCase().includes(k.toLowerCase())
+            );
+          if (involvesDeleted && cData?.type !== 'group') {
+            directConvIdsToDelete.add(convId);
+            await deleteDoc(doc(serverFirestore, 'users', otherUid, 'conversations', cDoc.id)).catch(() => {});
+          }
+        }
+      } catch {
+        // Ignore
+      }
+
+      try {
+        const msgSnap = await getDocs(
+          query(collection(serverFirestore, 'users', otherUid, 'messages'), limit(200))
+        );
+        for (const mDoc of msgSnap.docs) {
+          const mData = mDoc.data();
+          const senderId = String(mData?.senderId || '');
+          const convId = String(mData?.conversationId || '');
+          if (
+            candidateDocIds.has(senderId) ||
+            purgedKeys.has(senderId.toLowerCase()) ||
+            directConvIdsToDelete.has(convId)
+          ) {
+            await deleteDoc(doc(serverFirestore, 'users', otherUid, 'messages', mDoc.id)).catch(() => {});
+          }
+        }
+      } catch {
+        // Ignore
+      }
+    }
+
+    try {
+      const storiesSnap = await getDocs(query(collection(serverFirestore, 'stories'), limit(100)));
+      for (const sDoc of storiesSnap.docs) {
+        const sData = sDoc.data();
+        const authorUid = String(sData?.authorUid || '');
+        const authorId = String(sData?.authorId || '');
+        if (
+          candidateDocIds.has(authorUid) ||
+          candidateDocIds.has(authorId) ||
+          purgedKeys.has(authorUid.toLowerCase())
+        ) {
+          await deleteDoc(doc(serverFirestore, 'stories', sDoc.id)).catch(() => {});
+        }
+      }
+    } catch {
+      // Ignore
+    }
+
+    return Array.from(purgedKeys);
+  }
+
   // --- Users API ---
   public getUsers(): User[] {
-    return this.data.users.map(({ passwordHash, ...user }) => user);
+    return this.data.users
+      .filter(u => isSuperAdminIdentity(u) || !this.isUserPurged(u))
+      .map(({ passwordHash, ...user }) => ({
+        ...user,
+        role: isSuperAdminIdentity(user) ? 'superadmin' : user.role,
+      }));
   }
 
   public upsertExternalUsers(incomingUsers: Partial<User>[], publishToCloud = true): User[] {
@@ -455,7 +1040,7 @@ class AetherDatabase {
 
     for (const raw of incomingUsers) {
       if (!raw || (!raw.id && !raw.username && !raw.email)) continue;
-      if (raw.id && PURGED_USER_IDS.has(raw.id)) continue;
+      if (this.isUserPurged(raw)) continue;
       const cleanEmail = (raw.email || '').trim().toLowerCase();
       const cleanUsername = (raw.username || cleanEmail.split('@')[0] || raw.displayName || '')
         .trim()
@@ -463,7 +1048,13 @@ class AetherDatabase {
         .replace(/^@/, '')
         .replace(/[^a-z0-9_]/g, '_');
 
-      if (!cleanUsername || cleanUsername === 'directory_reader' || cleanUsername === 'guest_viewer') {
+      if (
+        !cleanUsername ||
+        cleanUsername === 'directory_reader' ||
+        cleanUsername === 'guest_viewer' ||
+        this.isUserPurged(cleanUsername) ||
+        this.isUserPurged(cleanEmail)
+      ) {
         continue;
       }
 
@@ -504,7 +1095,7 @@ class AetherDatabase {
           isOnline: true,
           lastSeen: new Date().toISOString(),
           createdAt: raw.createdAt || new Date().toISOString(),
-          role: 'user',
+          role: isSuperAdminIdentity(raw) || isSuperAdminIdentity(cleanUsername) ? 'superadmin' : 'user',
           passwordHash: '',
         };
         this.data.users.push(newUser);
@@ -531,6 +1122,9 @@ class AetherDatabase {
     const user = this.data.users.find(u => u.id === id) || this.getUserByUsername(id);
     if (!user) return undefined;
     const { passwordHash, ...safeUser } = user;
+    if (isSuperAdminIdentity(safeUser)) {
+      safeUser.role = 'superadmin';
+    }
     return safeUser;
   }
 
@@ -581,6 +1175,13 @@ class AetherDatabase {
   }
 
   public createUser(user: User & { passwordHash: string }): User {
+    if (isSuperAdminIdentity(user)) {
+      user.role = 'superadmin';
+    }
+    PURGED_USER_IDS.delete(user.id);
+    if (user.username) {
+      PURGED_USER_IDS.delete(user.username.toLowerCase().replace(/[^a-z0-9_]/g, '_'));
+    }
     this.data.users.push(user);
     this.data.userSettings[user.id] = {
       theme: 'dark',
@@ -975,7 +1576,9 @@ class AetherDatabase {
     } catch (err) {
       console.error('Failed to save conversation to SQLite', err);
     }
-    return this.getConversationById(convId, creatorId)!;
+    const hydrated = this.getConversationById(convId, creatorId)!;
+    void this.publishConversationToCloud(hydrated);
+    return hydrated;
   }
 
   public togglePinConversation(conversationId: string, userId: string): boolean {
@@ -1067,16 +1670,50 @@ class AetherDatabase {
 
   // --- Messages API ---
   public getMessages(conversationId: string): Message[] {
+    const matchingConvIds = new Set<string>([conversationId]);
+    const targetConv = this.data.conversations.find(c => c.id === conversationId);
+    const targetMembers = this.data.conversationMembers
+      .filter(m => m.conversationId === conversationId)
+      .map(m => m.userId);
+
+    const dmParts = conversationId.startsWith('c_dm_')
+      ? conversationId.slice('c_dm_'.length).split('__').filter(Boolean)
+      : [];
+    const peerIdentities = Array.from(new Set([...targetMembers, ...dmParts]));
+
+    if ((targetConv?.type === 'direct' || conversationId.startsWith('c_dm_')) && peerIdentities.length === 2) {
+      const [userA, userB] = peerIdentities;
+      for (const c of this.data.conversations) {
+        if (c.type !== 'direct' && !c.id.startsWith('c_dm_')) continue;
+        const cMembers = this.data.conversationMembers
+          .filter(m => m.conversationId === c.id)
+          .map(m => m.userId);
+        const cDmParts = c.id.startsWith('c_dm_')
+          ? c.id.slice('c_dm_'.length).split('__').filter(Boolean)
+          : [];
+        const allC = [...cMembers, ...cDmParts];
+        if (
+          allC.some(id => this.isSameUser(id, userA)) &&
+          allC.some(id => this.isSameUser(id, userB))
+        ) {
+          matchingConvIds.add(c.id);
+        }
+      }
+    }
+
     const byId = new Map<string, Message>();
     for (const m of this.data.messages) {
-      if (m && m.id && m.conversationId === conversationId && !m.isDeletedForEveryone) {
+      if (m && m.id && matchingConvIds.has(m.conversationId) && !m.isDeletedForEveryone) {
         byId.set(m.id, {
           ...m,
+          conversationId,
           sender: this.getUserById(m.senderId),
         });
       }
     }
-    return Array.from(byId.values());
+    return Array.from(byId.values()).sort(
+      (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
+    );
   }
 
   public getMessageById(messageId: string): Message | undefined {
@@ -1132,6 +1769,7 @@ class AetherDatabase {
     } catch (err) {
       console.error('Failed to save message to SQLite', err);
     }
+    void this.publishMessageToCloud(newMsg);
 
     return {
       ...newMsg,
@@ -1312,6 +1950,7 @@ class AetherDatabase {
     };
     this.data.stories.push(newStory);
     this.queueSave();
+    void this.publishStoryToCloud(newStory);
     return {
       ...newStory,
       user: this.getUserById(newStory.userId),
@@ -1381,19 +2020,40 @@ class AetherDatabase {
     };
   }
 
-  public createCall(callerId: string, receiverId: string, conversationId: string, type: 'voice' | 'video'): Call {
+  public createCall(
+    callerId: string,
+    receiverId: string,
+    conversationId: string,
+    type: 'voice' | 'video',
+    customCallId?: string
+  ): Call {
+    const resolvedCaller = this.getUserById(callerId);
+    const resolvedReceiver =
+      receiverId && !receiverId.startsWith('dial_') ? this.getUserById(receiverId) : undefined;
+    const effectiveCallerId = resolvedCaller?.id || callerId;
+    const effectiveReceiverId = resolvedReceiver?.id || receiverId;
+
+    if (customCallId) {
+      const existing = this.getCallById(customCallId);
+      if (existing) return existing;
+    }
+
     // End any stale ringing calls from the same caller
     this.data.calls.forEach(c => {
-      if ((c.callerId === callerId || c.receiverId === callerId) && (c.status === 'ringing' || c.status === 'initiating')) {
+      if (
+        (this.isSameUser(c.callerId, effectiveCallerId) ||
+          this.isSameUser(c.receiverId, effectiveCallerId)) &&
+        (c.status === 'ringing' || c.status === 'initiating')
+      ) {
         c.status = 'ended';
         c.endedAt = new Date().toISOString();
       }
     });
 
     const newCall: Call = {
-      id: `call_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
-      callerId,
-      receiverId,
+      id: customCallId || `call_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+      callerId: effectiveCallerId,
+      receiverId: effectiveReceiverId,
       conversationId: conversationId || 'c_direct_call',
       type,
       status: 'ringing',
@@ -1438,7 +2098,7 @@ class AetherDatabase {
 
   public getUserCalls(userId: string): Call[] {
     return (this.data.calls || [])
-      .filter(c => c.callerId === userId || c.receiverId === userId)
+      .filter(c => this.isSameUser(c.callerId, userId) || this.isSameUser(c.receiverId, userId))
       .map(c => this.getCallById(c.id)!)
       .filter(Boolean)
       .sort((a, b) => new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime());
@@ -1595,11 +2255,15 @@ class AetherDatabase {
 
     const dailyActivity: { date: string; messages: number; activeUsers: number }[] = [];
 
+    const totalConversations = this.data.conversations.length;
     return {
       totalUsers,
       activeUsers,
+      activeConnections: activeUsers,
       messagesSent,
+      totalMessages: messagesSent,
       totalGroups,
+      totalConversations,
       totalChannels,
       totalCalls,
       storageUsageBytes,
@@ -1609,11 +2273,97 @@ class AetherDatabase {
   }
 
   public toggleBanUser(userId: string): boolean {
-    const user = this.data.users.find(u => u.id === userId);
+    const user = this.data.users.find(u => this.isSameUser(u.id, userId));
     if (!user) return false;
+    if (isSuperAdminIdentity(user)) return false;
     user.isBanned = !user.isBanned;
     this.queueSave();
-    return user.isBanned;
+    return Boolean(user.isBanned);
+  }
+
+  public setUserRole(userId: string, role: 'user' | 'admin' | 'superadmin'): User | null {
+    const user = this.data.users.find(u => this.isSameUser(u.id, userId));
+    if (!user) return null;
+    if (isSuperAdminIdentity(user)) {
+      user.role = 'superadmin';
+    } else {
+      user.role = role;
+    }
+    this.queueSave();
+    const { passwordHash, ...safeUser } = user;
+    return safeUser;
+  }
+
+  public async clearUserChatsAdmin(targetIdOrUsername: string): Promise<boolean> {
+    if (!targetIdOrUsername) return false;
+    const raw = targetIdOrUsername.trim();
+    const clean = raw.toLowerCase().replace(/^@/, '');
+    const norm = clean.replace(/[^a-z0-9_]/g, '_');
+
+    const matchedUsers = this.data.users.filter(
+      u =>
+        this.isSameUser(u.id, raw) ||
+        u.username.toLowerCase() === clean ||
+        u.username.toLowerCase() === norm
+    );
+
+    const targetIds = new Set<string>([raw, clean, norm, ...matchedUsers.map(u => u.id)]);
+    const directConvIds = new Set<string>();
+
+    for (const m of this.data.conversationMembers) {
+      if (targetIds.has(m.userId)) {
+        const conv = this.data.conversations.find(c => c.id === m.conversationId);
+        if (conv && conv.type === 'direct') {
+          directConvIds.add(conv.id);
+        }
+      }
+    }
+    for (const c of this.data.conversations) {
+      if (c.type === 'direct' && norm && c.id.toLowerCase().includes(norm)) {
+        directConvIds.add(c.id);
+      }
+    }
+
+    this.data.messages = this.data.messages.filter(
+      m => !targetIds.has(m.senderId) && !directConvIds.has(m.conversationId)
+    );
+    this.data.conversationMembers = this.data.conversationMembers.filter(
+      m => !directConvIds.has(m.conversationId)
+    );
+    this.data.conversations = this.data.conversations.filter(c => !directConvIds.has(c.id));
+    this.data.stories = this.data.stories.filter(s => !targetIds.has(s.userId));
+    this.data.calls = this.data.calls.filter(
+      c => !targetIds.has(c.callerId) && !targetIds.has(c.receiverId || '')
+    );
+
+    this.saveSync();
+    return true;
+  }
+
+  public getAllConversationsAdmin(): Conversation[] {
+    return this.data.conversations
+      .filter(c => c && c.id && c.type !== 'channel')
+      .map(conv => {
+        const members = this.data.conversationMembers
+          .filter(m => m.conversationId === conv.id)
+          .map(m => ({
+            ...m,
+            user: this.getUserById(m.userId),
+          }));
+        const convMsgs = this.data.messages
+          .filter(m => m.conversationId === conv.id)
+          .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+        return {
+          ...conv,
+          members,
+          lastMessage: convMsgs[0] || conv.lastMessage,
+        };
+      })
+      .sort((a, b) => {
+        const timeA = a.lastMessage?.createdAt || a.createdAt;
+        const timeB = b.lastMessage?.createdAt || b.createdAt;
+        return new Date(timeB).getTime() - new Date(timeA).getTime();
+      });
   }
 
   public exportUserData(userId: string): any {

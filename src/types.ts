@@ -229,8 +229,11 @@ export interface DeviceSession {
 export interface AdminStats {
   totalUsers: number;
   activeUsers: number;
+  activeConnections?: number;
   messagesSent: number;
+  totalMessages?: number;
   totalGroups: number;
+  totalConversations?: number;
   totalChannels: number;
   totalCalls: number;
   storageUsageBytes: number;
@@ -247,6 +250,8 @@ export interface Report {
   reportedMessageId?: string;
   reportedMessageContent?: string;
   reportedConversationId?: string;
+  conversationId?: string;
+  messageId?: string;
   reason: string;
   details?: string;
   status: 'pending' | 'investigating' | 'resolved' | 'dismissed';

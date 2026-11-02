@@ -218,14 +218,20 @@ export const Message: React.FC<MessageProps> = ({
       onTouchEnd={cancelLongPress}
       onTouchMove={cancelLongPress}
       onContextMenu={e => onContextMenu(e, msg)}
-      className={`relative group flex flex-col ${
-        isMe ? 'items-end' : 'items-start'
+      className={`w-full relative group flex flex-col ${
+        isMe ? 'items-end self-end ml-auto' : 'items-start self-start mr-auto'
       } transition-all ${
         isActiveContextMenu || isLongPressed
           ? 'ring-1 ring-white/40 rounded-2xl'
           : ''
       }`}
     >
+      {/* Sender Name Label for Received Messages (Left side) */}
+      {!isMe && msg.sender?.displayName && (
+        <span className="text-[11px] font-semibold text-neutral-400 mb-1 ml-1 select-none">
+          {msg.sender.displayName}
+        </span>
+      )}
       {/* Floating Reaction & Quick Action Toolbar on Hover or Long-Press */}
       {showReactionToolbar && (
         <div

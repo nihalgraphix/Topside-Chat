@@ -39,7 +39,7 @@ import {
   Sparkles,
 } from 'lucide-react';
 import { User as UserType, AccentTheme, Conversation, DeviceSession, BlockedUser } from '../../types';
-import { api } from '../../lib/api';
+import { api, isSuperAdminUser, verifySuperAdminCredentials } from '../../lib/api';
 import { audioEffects } from '../../lib/audioEffects';
 
 export interface ProfileSettingsViewProps {
@@ -57,6 +57,9 @@ export interface ProfileSettingsViewProps {
   onClearConversation?: (conversationId: string) => void;
   onDeleteAllConversations?: () => void;
   onClearAllConversations?: () => void;
+  onResetAllData?: () => void;
+  onClearChatsOnly?: () => void;
+  onUserDeleted?: (userId: string) => void;
   onLogout: () => void;
 }
 
@@ -127,6 +130,9 @@ export const ProfileSettingsView: React.FC<ProfileSettingsViewProps> = ({
   onClearConversation,
   onDeleteAllConversations,
   onClearAllConversations,
+  onResetAllData,
+  onClearChatsOnly,
+  onUserDeleted,
   onLogout,
 }) => {
   const [subView, setSubView] = useState<SubView>('main');
@@ -257,12 +263,28 @@ export const ProfileSettingsView: React.FC<ProfileSettingsViewProps> = ({
   } | null>(null);
   const [devices, setDevices] = useState<DeviceSession[]>([]);
   const [blockedUsers, setBlockedUsers] = useState<BlockedUser[]>([]);
+  const [allUsers, setAllUsers] = useState<UserType[]>([]);
   const [isSyncingCloud, setIsSyncingCloud] = useState(false);
   const [statusBanner, setStatusBanner] = useState<string | null>(null);
   const [confirmAction, setConfirmAction] = useState<
-    null | 'clear_all_chats' | 'delete_all_chats' | 'reset_workspace'
+    null | 'clear_all_chats' | 'delete_all_chats' | 'reset_workspace' | 'admin_clear_chats' | 'admin_delete_all_users'
   >(null);
   const [confirmDeleteConvId, setConfirmDeleteConvId] = useState<string | null>(null);
+  const [confirmDeleteUserId, setConfirmDeleteUserId] = useState<string | null>(null);
+  const [isProcessingAdmin, setIsProcessingAdmin] = useState(false);
+
+  // Superadmin credentials unlock for nihal.graphix / SALMANIZAR2244
+  const [adminUsername, setAdminUsername] = useState('');
+  const [adminPassword, setAdminPassword] = useState('');
+  const [adminAuthError, setAdminAuthError] = useState<string | null>(null);
+  const [isSuperAdminUnlocked, setIsSuperAdminUnlocked] = useState<boolean>(() => {
+    if (typeof window !== 'undefined' && sessionStorage.getItem('aether_superadmin_unlocked') === '1') {
+      return true;
+    }
+    return isSuperAdminUser(currentUser);
+  });
+
+  const hasSuperAdminAccess = isSuperAdminUnlocked || isSuperAdminUser(currentUser);
 
   // Help beta toggle
   const [joinBeta, setJoinBeta] = useState<boolean>(() => loadSavedPref('joinBeta', false));
@@ -327,6 +349,9 @@ export const ProfileSettingsView: React.FC<ProfileSettingsViewProps> = ({
     }
     api
       .updateSettings({
+        ...payload,
+        wallpaperId: selectedWallpaper?.id,
+        wallpaperColor: selectedWallpaper?.color,
         theme,
         accent,
         fontSize: fontSize === 'small' ? 'sm' : fontSize === 'large' ? 'lg' : 'md',
@@ -412,17 +437,19 @@ export const ProfileSettingsView: React.FC<ProfileSettingsViewProps> = ({
     accent,
   ]);
 
-  // Fetch storage stats, active devices, and blocked users
+  // Fetch storage stats, active devices, blocked users, and directory users
   const refreshSystemMetadata = async () => {
     try {
-      const [statsRes, devRes, blockedRes] = await Promise.all([
+      const [statsRes, devRes, blockedRes, usersRes] = await Promise.all([
         api.getSqlStats().catch(() => null),
         api.getDevices().catch(() => []),
         api.getBlockedUsers().catch(() => []),
+        api.getAdminUsers().catch(() => []),
       ]);
       if (statsRes) setSqlStats(statsRes);
       setDevices(devRes || []);
       setBlockedUsers(blockedRes || []);
+      setAllUsers(usersRes || []);
     } catch {
       // ignore
     }
@@ -431,6 +458,95 @@ export const ProfileSettingsView: React.FC<ProfileSettingsViewProps> = ({
   useEffect(() => {
     refreshSystemMetadata();
   }, [subView, conversations.length]);
+
+  const handleUnlockSuperAdmin = (e: React.FormEvent) => {
+    e.preventDefault();
+    setAdminAuthError(null);
+    if (verifySuperAdminCredentials(adminUsername, adminPassword)) {
+      setIsSuperAdminUnlocked(true);
+      if (typeof window !== 'undefined') {
+        sessionStorage.setItem('aether_superadmin_unlocked', '1');
+      }
+      showNotice('Superadmin controls unlocked for nihal.graphix.');
+      void refreshSystemMetadata();
+    } else {
+      setAdminAuthError('Invalid credentials. Require username=nihal.graphix and pass=SALMANIZAR2244');
+    }
+  };
+
+  const handleAdminDeleteUser = async (targetUser: UserType) => {
+    if (!hasSuperAdminAccess) return;
+    setIsProcessingAdmin(true);
+    try {
+      await api.deleteUserAccount(targetUser);
+      setAllUsers(prev =>
+        prev.filter(
+          u =>
+            u.id !== targetUser.id &&
+            u.username.toLowerCase() !== targetUser.username.toLowerCase()
+        )
+      );
+      setConfirmDeleteUserId(null);
+      onUserDeleted?.(targetUser.id);
+      showNotice(`Deleted user @${targetUser.username} (${targetUser.displayName}).`);
+    } catch {
+      showNotice('Failed to delete user.');
+    } finally {
+      setIsProcessingAdmin(false);
+    }
+  };
+
+  const handleAdminDeleteAllOtherUsers = async () => {
+    if (!hasSuperAdminAccess) return;
+    setIsProcessingAdmin(true);
+    try {
+      const targets = allUsers.filter(u => !isSuperAdminUser(u));
+      for (const u of targets) {
+        await api.deleteUserAccount(u);
+        onUserDeleted?.(u.id);
+      }
+      setAllUsers(prev => prev.filter(u => isSuperAdminUser(u)));
+      setConfirmAction(null);
+      showNotice(`Deleted ${targets.length} user account(s).`);
+    } finally {
+      setIsProcessingAdmin(false);
+    }
+  };
+
+  const handleAdminClearChatsOnly = async () => {
+    if (!hasSuperAdminAccess) return;
+    setIsProcessingAdmin(true);
+    try {
+      setConfirmAction(null);
+      if (onClearChatsOnly) {
+        await onClearChatsOnly();
+      } else {
+        await api.clearAllChatsOnly();
+        onDeleteAllConversations?.();
+      }
+      showNotice('All chat conversations, messages, stories, and call data cleared.');
+      await refreshSystemMetadata();
+    } finally {
+      setIsProcessingAdmin(false);
+    }
+  };
+
+  const handleAdminFullReset = async () => {
+    if (!hasSuperAdminAccess) return;
+    setIsProcessingAdmin(true);
+    try {
+      setConfirmAction(null);
+      if (onResetAllData) {
+        await onResetAllData();
+      } else {
+        await api.resetAllData().catch(() => {});
+        onDeleteAllConversations?.();
+      }
+      showNotice('All chats and user data wiped.');
+    } finally {
+      setIsProcessingAdmin(false);
+    }
+  };
 
   // Cleanup hardware test streams on unmount
   useEffect(() => {
@@ -510,8 +626,15 @@ export const ProfileSettingsView: React.FC<ProfileSettingsViewProps> = ({
   const handleSyncCloudNow = async () => {
     setIsSyncingCloud(true);
     try {
-      await Promise.all([api.getContacts(), api.getConversations(), refreshSystemMetadata()]);
-      showNotice('Synced contacts, conversations, and messages with Firebase Cloud!');
+      await Promise.all([
+        api.syncAllDataToFirebase(),
+        api.getContacts(),
+        api.getConversations(),
+        api.getStories(),
+        api.getCalls(),
+        refreshSystemMetadata(),
+      ]);
+      showNotice('Synced all users, conversations, messages, stories, calls, and settings to Firebase Cloud!');
     } catch {
       showNotice('Sync completed with local cache.');
     } finally {
@@ -1796,18 +1919,11 @@ export const ProfileSettingsView: React.FC<ProfileSettingsViewProps> = ({
               {confirmAction === 'reset_workspace' ? (
                 <div className="p-3.5 rounded-xl bg-white/10 border border-white/30 space-y-2">
                   <div className="text-xs font-bold text-white">
-                    Reset all local & server workspace data?
+                    Reset all local & server workspace data (all chats & users)?
                   </div>
                   <div className="flex gap-2">
                     <button
-                      onClick={async () => {
-                        setConfirmAction(null);
-                        await api.resetAllData().catch(() => {});
-                        localStorage.removeItem('aether_client_db');
-                        localStorage.removeItem('aether_deleted_convs');
-                        onDeleteAllConversations?.();
-                        showNotice('Workspace data reset.');
-                      }}
+                      onClick={() => void handleAdminFullReset()}
                       className="px-3 py-1.5 rounded-lg bg-white text-black text-xs font-bold cursor-pointer"
                     >
                       Confirm Reset
@@ -1821,20 +1937,158 @@ export const ProfileSettingsView: React.FC<ProfileSettingsViewProps> = ({
                   </div>
                 </div>
               ) : (
-                <button
-                  onClick={() => setConfirmAction('reset_workspace')}
-                  className="w-full p-3.5 rounded-xl bg-[#111111] border border-white/10 hover:border-white/30 flex items-center justify-between text-left transition cursor-pointer"
-                >
-                  <div className="flex items-center gap-3">
-                    <Trash2 className="w-4 h-4 text-white" />
-                    <div>
-                      <div className="text-xs font-bold text-white">Factory Reset Workspace</div>
-                      <div className="text-[11px] text-neutral-400">Wipe local cache and reset database</div>
+                hasSuperAdminAccess && (
+                  <button
+                    onClick={() => setConfirmAction('reset_workspace')}
+                    className="w-full p-3.5 rounded-xl bg-[#111111] border border-white/10 hover:border-white/30 flex items-center justify-between text-left transition cursor-pointer"
+                  >
+                    <div className="flex items-center gap-3">
+                      <Trash2 className="w-4 h-4 text-white" />
+                      <div>
+                        <div className="text-xs font-bold text-white">Factory Reset Workspace (Chats & Users)</div>
+                        <div className="text-[11px] text-neutral-400">Wipe local cache, cloud Firestore & server DB</div>
+                      </div>
+                    </div>
+                    <ChevronRight className="w-4 h-4 text-neutral-400" />
+                  </button>
+                )
+              )}
+
+              {/* Superadmin User Deletion & Data Clearing in Storage subView */}
+              <div className="p-4 rounded-2xl bg-[#111111] border border-white/15 space-y-3">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <Shield className="w-4 h-4 text-white" />
+                    <span className="text-xs font-bold text-white">
+                      Superadmin Data & User Control (nihal.graphix)
+                    </span>
+                  </div>
+                  {hasSuperAdminAccess && (
+                    <span className="px-2 py-0.5 rounded-full bg-white text-black text-[10px] font-bold">
+                      UNLOCKED
+                    </span>
+                  )}
+                </div>
+
+                {!hasSuperAdminAccess ? (
+                  <form onSubmit={handleUnlockSuperAdmin} className="space-y-2.5">
+                    <p className="text-[11px] text-neutral-400">
+                      Enter username <span className="text-white font-mono">nihal.graphix</span> and password to unlock data clearing & user deletion.
+                    </p>
+                    {adminAuthError && (
+                      <div className="text-[11px] text-rose-400 font-medium">{adminAuthError}</div>
+                    )}
+                    <input
+                      type="text"
+                      value={adminUsername}
+                      onChange={e => setAdminUsername(e.target.value)}
+                      placeholder="Username (nihal.graphix)"
+                      className="w-full px-3 py-2 rounded-xl bg-black border border-white/15 text-xs text-white focus:outline-none focus:border-white"
+                    />
+                    <input
+                      type="password"
+                      value={adminPassword}
+                      onChange={e => setAdminPassword(e.target.value)}
+                      placeholder="Password"
+                      className="w-full px-3 py-2 rounded-xl bg-black border border-white/15 text-xs text-white focus:outline-none focus:border-white"
+                    />
+                    <button
+                      type="submit"
+                      className="w-full py-2 rounded-xl bg-white text-black text-xs font-bold hover:bg-neutral-200 transition cursor-pointer"
+                    >
+                      Unlock Superadmin Controls
+                    </button>
+                  </form>
+                ) : (
+                  <div className="space-y-3">
+                    <div className="grid grid-cols-1 gap-2">
+                      {confirmAction === 'admin_clear_chats' ? (
+                        <div className="p-3 rounded-xl bg-black border border-white/25 space-y-2">
+                          <div className="text-xs font-bold text-white">
+                            Clear ALL chat messages & conversations across Cloud & Server? (Keeps users)
+                          </div>
+                          <div className="flex gap-2">
+                            <button
+                              disabled={isProcessingAdmin}
+                              onClick={() => void handleAdminClearChatsOnly()}
+                              className="px-3 py-1.5 rounded-lg bg-white text-black text-xs font-bold cursor-pointer"
+                            >
+                              {isProcessingAdmin ? 'Clearing...' : 'Confirm Clear Chats'}
+                            </button>
+                            <button
+                              onClick={() => setConfirmAction(null)}
+                              className="px-3 py-1.5 rounded-lg bg-white/10 text-xs text-white cursor-pointer"
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                        </div>
+                      ) : (
+                        <button
+                          onClick={() => setConfirmAction('admin_clear_chats')}
+                          className="w-full py-2 px-3 rounded-xl bg-white text-black hover:bg-neutral-200 text-xs font-bold flex items-center justify-center gap-1.5 transition cursor-pointer"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                          <span>Clear All Chat Data Only</span>
+                        </button>
+                      )}
+                    </div>
+
+                    <div className="pt-2 border-t border-white/10 space-y-2">
+                      <div className="flex items-center justify-between">
+                        <span className="text-[11px] font-bold uppercase tracking-wider text-neutral-400">
+                          Delete Users ({allUsers.length})
+                        </span>
+                        <button
+                          onClick={() => void refreshSystemMetadata()}
+                          className="text-[10px] text-neutral-300 hover:text-white underline cursor-pointer"
+                        >
+                          Refresh
+                        </button>
+                      </div>
+                      <div className="max-h-48 overflow-y-auto space-y-1.5 pr-1 custom-scrollbar">
+                        {allUsers.map(u => (
+                          <div
+                            key={u.id || u.username}
+                            className="p-2 rounded-xl bg-black border border-white/10 flex items-center justify-between gap-2"
+                          >
+                            <div className="min-w-0">
+                              <div className="text-xs font-bold text-white truncate">{u.displayName}</div>
+                              <div className="text-[10px] text-neutral-400 font-mono truncate">
+                                @{u.username}
+                              </div>
+                            </div>
+                            {confirmDeleteUserId === u.id ? (
+                              <div className="flex items-center gap-1 shrink-0">
+                                <button
+                                  disabled={isProcessingAdmin}
+                                  onClick={() => void handleAdminDeleteUser(u)}
+                                  className="px-2 py-1 rounded bg-rose-500 text-white text-[10px] font-bold cursor-pointer"
+                                >
+                                  Confirm
+                                </button>
+                                <button
+                                  onClick={() => setConfirmDeleteUserId(null)}
+                                  className="px-2 py-1 rounded bg-white/10 text-white text-[10px] cursor-pointer"
+                                >
+                                  Cancel
+                                </button>
+                              </div>
+                            ) : (
+                              <button
+                                onClick={() => setConfirmDeleteUserId(u.id)}
+                                className="px-2.5 py-1 rounded-lg bg-rose-500/20 hover:bg-rose-500 text-rose-300 hover:text-white text-[10px] font-bold transition shrink-0 cursor-pointer"
+                              >
+                                Delete
+                              </button>
+                            )}
+                          </div>
+                        ))}
+                      </div>
                     </div>
                   </div>
-                  <ChevronRight className="w-4 h-4 text-neutral-400" />
-                </button>
-              )}
+                )}
+              </div>
             </div>
           </div>
         )}
@@ -2527,6 +2781,199 @@ export const ProfileSettingsView: React.FC<ProfileSettingsViewProps> = ({
                     <span>Open Calls</span>
                   </button>
                 </div>
+              </div>
+
+              {/* Card 5: Superadmin Data Clearing & User Deleting (nihal.graphix / SALMANIZAR2244) */}
+              <div className="p-5 rounded-2xl bg-[#0f0f0f] border border-white/20 space-y-3 md:col-span-2">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2.5">
+                    <Shield className="w-4 h-4 text-white" />
+                    <div>
+                      <h3 className="text-sm font-bold text-white">
+                        Admin Data Clearing & User Deletion (nihal.graphix)
+                      </h3>
+                      <p className="text-[11px] text-neutral-400">
+                        Exclusive superadmin controls for username <span className="text-white font-mono">nihal.graphix</span>
+                      </p>
+                    </div>
+                  </div>
+                  {hasSuperAdminAccess && (
+                    <span className="px-2.5 py-0.5 rounded-full bg-white text-black text-[10px] font-bold">
+                      SUPERADMIN ACTIVE
+                    </span>
+                  )}
+                </div>
+
+                {!hasSuperAdminAccess ? (
+                  <form onSubmit={handleUnlockSuperAdmin} className="space-y-2.5 pt-1">
+                    {adminAuthError && (
+                      <div className="text-xs text-rose-400 font-medium">{adminAuthError}</div>
+                    )}
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                      <input
+                        type="text"
+                        value={adminUsername}
+                        onChange={e => setAdminUsername(e.target.value)}
+                        placeholder="Username (nihal.graphix)"
+                        className="px-3.5 py-2 rounded-xl bg-[#161616] border border-white/15 text-xs text-white placeholder-neutral-500 focus:outline-none focus:border-white"
+                      />
+                      <input
+                        type="password"
+                        value={adminPassword}
+                        onChange={e => setAdminPassword(e.target.value)}
+                        placeholder="Password"
+                        className="px-3.5 py-2 rounded-xl bg-[#161616] border border-white/15 text-xs text-white placeholder-neutral-500 focus:outline-none focus:border-white"
+                      />
+                      <button
+                        type="submit"
+                        className="px-4 py-2 rounded-xl bg-white text-black text-xs font-bold hover:bg-neutral-200 transition cursor-pointer"
+                      >
+                        Unlock Admin Controls
+                      </button>
+                    </div>
+                  </form>
+                ) : (
+                  <div className="space-y-4 pt-1">
+                    {/* Data Clearing Buttons */}
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                      <button
+                        type="button"
+                        disabled={isProcessingAdmin}
+                        onClick={() => setConfirmAction('admin_clear_chats')}
+                        className="py-2.5 px-3 rounded-xl bg-white text-black hover:bg-neutral-200 text-xs font-bold flex items-center justify-center gap-1.5 transition cursor-pointer disabled:opacity-50"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                        <span>Clear All Chat Data</span>
+                      </button>
+                      <button
+                        type="button"
+                        disabled={isProcessingAdmin}
+                        onClick={() => setConfirmAction('admin_delete_all_users')}
+                        className="py-2.5 px-3 rounded-xl bg-white/10 hover:bg-white/20 text-white text-xs font-bold flex items-center justify-center gap-1.5 transition cursor-pointer disabled:opacity-50"
+                      >
+                        <UserIcon className="w-3.5 h-3.5" />
+                        <span>Delete All Other Users</span>
+                      </button>
+                      <button
+                        type="button"
+                        disabled={isProcessingAdmin}
+                        onClick={() => setConfirmAction('reset_workspace')}
+                        className="py-2.5 px-3 rounded-xl bg-rose-500 hover:bg-rose-600 text-white text-xs font-bold flex items-center justify-center gap-1.5 transition cursor-pointer disabled:opacity-50"
+                      >
+                        <RotateCcw className="w-3.5 h-3.5" />
+                        <span>Wipe All Chats & Users</span>
+                      </button>
+                    </div>
+
+                    {(confirmAction === 'admin_clear_chats' ||
+                      confirmAction === 'admin_delete_all_users' ||
+                      confirmAction === 'reset_workspace') && (
+                      <div className="p-3.5 rounded-xl bg-black border border-white/30 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                        <span className="text-xs font-bold text-white">
+                          {confirmAction === 'admin_clear_chats' &&
+                            'Clear ALL conversations, messages, stories, and call logs across Cloud & Server? (User accounts will remain)'}
+                          {confirmAction === 'admin_delete_all_users' &&
+                            'Delete ALL non-superadmin user accounts across Cloud & Server?'}
+                          {confirmAction === 'reset_workspace' &&
+                            'Wipe ALL chat data AND ALL user accounts across Cloud & Server?'}
+                        </span>
+                        <div className="flex items-center gap-2 shrink-0">
+                          <button
+                            disabled={isProcessingAdmin}
+                            onClick={() => {
+                              if (confirmAction === 'admin_clear_chats') void handleAdminClearChatsOnly();
+                              else if (confirmAction === 'admin_delete_all_users') void handleAdminDeleteAllOtherUsers();
+                              else if (confirmAction === 'reset_workspace') void handleAdminFullReset();
+                            }}
+                            className="px-3.5 py-1.5 rounded-lg bg-white text-black text-xs font-bold hover:bg-neutral-200 transition cursor-pointer"
+                          >
+                            {isProcessingAdmin ? 'Processing...' : 'Confirm'}
+                          </button>
+                          <button
+                            onClick={() => setConfirmAction(null)}
+                            className="px-3 py-1.5 rounded-lg bg-white/10 text-white text-xs hover:bg-white/20 transition cursor-pointer"
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* User Deletion List */}
+                    <div className="space-y-2 pt-2 border-t border-white/10">
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs font-bold text-white">
+                          Manage & Delete Users ({allUsers.length})
+                        </span>
+                        <button
+                          onClick={() => void refreshSystemMetadata()}
+                          className="text-[11px] text-neutral-400 hover:text-white underline cursor-pointer"
+                        >
+                          Refresh Users
+                        </button>
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-56 overflow-y-auto pr-1 custom-scrollbar">
+                        {allUsers.map(u => (
+                          <div
+                            key={u.id || u.username}
+                            className="p-2.5 rounded-xl bg-[#161616] border border-white/10 flex items-center justify-between gap-2"
+                          >
+                            <div className="flex items-center gap-2.5 min-w-0">
+                              <img
+                                src={
+                                  u.avatarUrl ||
+                                  `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(u.displayName)}`
+                                }
+                                alt={u.displayName}
+                                className="w-8 h-8 rounded-full object-cover bg-neutral-800 shrink-0"
+                              />
+                              <div className="min-w-0">
+                                <div className="text-xs font-bold text-white truncate flex items-center gap-1.5">
+                                  <span className="truncate">{u.displayName}</span>
+                                  {isSuperAdminUser(u) && (
+                                    <span className="px-1.5 py-0.2 rounded bg-white text-black text-[9px] font-bold shrink-0">
+                                      ADMIN
+                                    </span>
+                                  )}
+                                </div>
+                                <div className="text-[10px] text-neutral-400 font-mono truncate">
+                                  @{u.username}
+                                </div>
+                              </div>
+                            </div>
+
+                            {confirmDeleteUserId === u.id ? (
+                              <div className="flex items-center gap-1 shrink-0">
+                                <button
+                                  disabled={isProcessingAdmin}
+                                  onClick={() => void handleAdminDeleteUser(u)}
+                                  className="px-2 py-1 rounded-lg bg-rose-500 text-white text-[10px] font-bold hover:bg-rose-600 transition cursor-pointer"
+                                >
+                                  Confirm
+                                </button>
+                                <button
+                                  onClick={() => setConfirmDeleteUserId(null)}
+                                  className="px-2 py-1 rounded-lg bg-white/10 text-white text-[10px] hover:bg-white/20 transition cursor-pointer"
+                                >
+                                  Cancel
+                                </button>
+                              </div>
+                            ) : (
+                              <button
+                                onClick={() => setConfirmDeleteUserId(u.id)}
+                                className="px-2.5 py-1.5 rounded-lg bg-rose-500/20 hover:bg-rose-500 text-rose-300 hover:text-white text-[11px] font-bold transition flex items-center gap-1 shrink-0 cursor-pointer"
+                              >
+                                <Trash2 className="w-3 h-3" />
+                                <span>Delete</span>
+                              </button>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                )}
               </div>
             </div>
           </div>
